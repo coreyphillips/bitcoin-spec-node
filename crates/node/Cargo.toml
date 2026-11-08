@@ -1,0 +1,13 @@
+[package]
+name = "bitcoin-spec-node"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bitcoin-spec-node"
+path = "src/main.rs"
+
+[dependencies]
+bsn-consensus = { path = "../consensus" }
+serde_json = "1"

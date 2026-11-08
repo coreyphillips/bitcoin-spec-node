@@ -1,0 +1,16 @@
+[package]
+name = "bsn-consensus"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "consensus"
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+ripemd = "0.1"
+sha1 = "0.10"
+secp256k1 = { version = "0.31", features = ["global-context"] }
+rayon = "1"

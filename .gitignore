@@ -1,0 +1,12 @@
+# Build output
+/target/
+**/target/
+
+# Test data, regtest datadirs, logs and scratch output
+/test-data/
+/bench-data/
+*.log
+
+# The specification package is provided by the experiment owner and is read-only here;
+# it is not part of this repository's history.
+/spec-package/

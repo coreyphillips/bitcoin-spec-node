@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/consensus", "crates/node"]
+exclude = ["spec-package"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+debug = 1
+codegen-units = 16
+
+# Consensus arithmetic must never wrap silently (the reference is compiled with overflow checks).
+[profile.release.package.bsn-consensus]
+overflow-checks = true
