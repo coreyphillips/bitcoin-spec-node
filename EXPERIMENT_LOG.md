@@ -530,6 +530,63 @@ p2p_segwit.node1                                 268    match    16.4s  tip 025e
 RESULT: PASS
 ```
 
+
+### M4: performance and memory (2026-11-08)
+
+Measurements on the Apple M5 Pro (6 performance + 12 efficiency cores, 64 GB), all with the
+conformance suites and the kill/restart scenario passing after each change. Numbers marked
+"idle" were taken before the experiment owner's holdout runs started; later ones ran next to them
+(load average 25 to 38) and are slower.
+
+| What | Result |
+|---|---|
+| libsecp256k1 through the chapter 02 wrappers (`bsn-txgen --bench-sigs`) | 20 us per ECDSA or Schnorr verification on one core; 621,000 per second on 18 threads |
+| Bitcoin Core v32.1 serving its blocks over P2P, 16 in flight (`bsn-txgen --bench-download`) | 2,152 blocks/s, 1.8 GB/s on regtest (not a bottleneck) |
+| Regtest chain of 902 blocks, 1.96 million transactions (about 4 million inputs) built by `bsn-txgen`, synced from Core (`regtest.py bench`), first node version | 13.8 s, 65 blocks/s, 141,000 tx/s; 6.6 cores busy on average (idle) |
+| same, after batched activation (one activation per message batch, pipelined script checks) and download refills from the reader threads | 10.5 s, 86 blocks/s, 187,000 tx/s (idle) |
+| same, under the holdout load | 18 to 31 s |
+| Coin flush (`bitcoin-spec-node bench-flush`): 20 million new coins, then 10 million deletions, into RocksDB as parallel SST files ingested atomically | 2.0 s and 0.9 s; fingerprint of 10 million coins 4.4 s (under load) |
+| Public testnet4, 8 DNS-seed peers | heights 0 to 35,703 in 100 s (about 360 blocks/s) |
+| Public mainnet, DNS-seed peers (short test only) | heights 0 to 31,810 in about 6 minutes; up to 808 blocks/s once headers were ahead; header download from busy public peers (8 parallel header syncs, peers serving blocks at the same time) was the limit, 576,000 headers after 5.5 minutes |
+| Peak memory, regtest benchmark (`--dbcache 1000`) | 1.9 GB resident |
+
+What the profile (`sample`) showed and what changed because of it:
+
+1. With one activation per received block (the reference's order), every activation saw one block,
+   so the script pipeline never filled, and downloads paused while blocks were connected; only 6.6
+   of 18 cores were busy. The node now stores all blocks of a message batch and activates once
+   (the chain selected is the same; see the design note below), connects the path with up to four
+   blocks in progress (block k's scripts verify while block k+1's transactions are applied to a
+   view that includes block k's uncommitted changes; commits are strictly in order and a failure is
+   acted on only after every earlier block committed), and the peer reader threads refill block
+   requests as blocks arrive.
+2. The chain thread then became the limit (on regtest mostly the BIP30 lookups that regtest
+   enforces for every output). Context-free block checks and merkle roots moved into the parallel
+   decode step, the spent outputs for script checks are built inside the parallel script job, and
+   per-transaction legacy sigop counts are computed once.
+3. Small blocks (fewer than 8 inputs) are now checked inline: handing them to the thread pool cost
+   about 80 us each, which dominated the early mainnet chain.
+4. The coin cache is a hash table sized once from `--dbcache` (88-byte slots with scripts up to 35
+   bytes inline, longer scripts in a side table), flushed and emptied before it would have to grow,
+   so it never reallocates (a resize of a 12 GB table would need 24 GB at once). The flush splits
+   the dirty entries into 16 key ranges that are sorted and written to separate SST files in
+   parallel and ingested with one atomic `IngestExternalFile` call.
+
+Design note on batched activation: chapter 11 requires that the selected chain equals the
+reference's after every block processed. Storing a batch of blocks and activating once selects the
+same chain (candidates are kept and compared exactly as in the reference); it can differ only in
+what is remembered about descendants of a block that fails to connect within the same batch (they
+are stored and then marked invalid, instead of being refused as children of an invalid block), and
+in which unrequested blocks are reduced to headers, neither of which changes the active chain. The
+harness keeps the reference's order (one activation per block), so the corpus checks the exact
+semantics.
+
+Estimate for mainnet from the local Core node (single peer, `--dbcache 12000`): late blocks are
+bounded by script verification (about 7,000 inputs per block at 22 us of CPU each, 9 ms per block
+on 17 threads) and by the chain thread's serial UTXO work (about 10 ms per block), so 60 to 100
+blocks per second; 12 GB coin cache (117 million coins) flushed in about 10 to 15 s each time it
+fills. Total memory stays around 14 GB.
+
 ## Bugs found
 
 Every bug found so far, with its root cause and whether the specification was at fault. (The

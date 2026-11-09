@@ -79,3 +79,15 @@ header checks have passed", while PROTOCOL.md 4.9 just lists `invalid` / `too-li
 The reference API has no side-effect-free way to run the contextual header checks for a block that
 must not be stored. Assumed: the harness reports the `check_block` failure if there is one, else
 `too-little-chainwork`. Diagnostic only. Status: open.
+
+### F8. Chapter 11 section 11.12: activation after loading persisted state (suggestion)
+
+The restart bug of `EXPERIMENT_LOG.md` (bug 2) was mine, not the specification's: 11.12 says a
+production node must behave as if every block went through `process_block`, which always ends with
+chain activation, and CORPUS.md 2.6 says "the active chain is selected again at startup". But the
+reference keeps everything in memory, so nothing in its code shows the restart path, and a node
+that restructures activation (here: one activation per batch of received blocks) can miss that
+blocks persisted above the last flushed tip need an activation of their own. A one-line note in
+11.12 ("after loading persisted state, run `activate_best_chain` before waiting for new data; Core:
+`ActivateBestChain` at the end of `LoadChainTip`/init") would have prevented it.
+Status: suggestion only; not a defect.

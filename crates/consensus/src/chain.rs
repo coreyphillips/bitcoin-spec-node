@@ -1076,6 +1076,16 @@ impl PendingBlock {
     fn start(id: EntryId, block: Arc<BlockData>, prepared: PreparedBlock) -> PendingBlock {
         let PreparedBlock { changes, undo, flags } = prepared;
         let (sender, receiver) = std::sync::mpsc::channel();
+        // A block with few inputs is checked right here: handing it to the pool costs more than
+        // checking it (most early blocks have none).
+        let inputs: usize = block.block.transactions.iter().skip(1).map(|tx| tx.inputs.len()).sum();
+        if inputs < 8 {
+            let started = std::time::Instant::now();
+            let result = verify_block_scripts(&block.block.transactions, &undo, flags);
+            timing::add(&timing::SCRIPTS_NS, started);
+            let _ = sender.send(result);
+            return PendingBlock { id, block, changes, undo, scripts: receiver };
+        }
         let job_block = block.clone();
         let job_undo = undo.clone();
         rayon::spawn(move || {
