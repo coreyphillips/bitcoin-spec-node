@@ -117,7 +117,9 @@ impl CoinDb for RocksCoinDb {
         if outpoints.len() < 64 {
             return outpoints.iter().map(|op| self.get(op)).collect();
         }
-        outpoints.par_iter().with_min_len(16).map(|op| self.get(op)).collect()
+        // Reads run on their own pool: on the global pool they would queue behind the script
+        // checks of earlier blocks, and the chain thread waits for them.
+        io_pool().install(|| outpoints.par_iter().with_min_len(16).map(|op| self.get(op)).collect())
     }
 
     fn write(&mut self, changes: &mut dyn Iterator<Item = (OutPoint, Option<CoinRef<'_>>)>, best: &Hash256) -> io::Result<()> {
@@ -237,6 +239,12 @@ impl CoinDb for RocksCoinDb {
         }
         iter.status().map_err(to_io)
     }
+}
+
+/// Threads for coin database reads (I/O bound, so they may outnumber the cores).
+fn io_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(16).thread_name(|i| format!("coin-read-{i}")).build().expect("coin read pool"))
 }
 
 /// Computes the chapter 15 fingerprint of the coin database as it is when this is called. The
