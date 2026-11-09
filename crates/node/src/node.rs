@@ -582,7 +582,11 @@ impl Node {
                 self.send(peer, "sendheaders", &[]);
                 let best = self.chain.best_header;
                 self.request_headers(peer, best);
-                self.downloads.lock().unwrap().set_ready(peer, start_height);
+                // Headers first: blocks are requested from a peer once its header chain is known
+                // (block requests would otherwise delay its answers to `getheaders`).
+                if self.chain.best_header().height >= start_height {
+                    self.downloads.lock().unwrap().set_ready(peer, start_height);
+                }
             }
             "getheaders" => {
                 if let Ok((locator, stop)) = decode_getheaders(payload) {
@@ -641,6 +645,8 @@ impl Node {
             }
         };
         if headers.is_empty() {
+            let start_height = self.peers.get(&peer).map_or(0, |p| p.start_height);
+            self.downloads.lock().unwrap().set_ready(peer, start_height);
             return;
         }
         self.last_progress = Instant::now();
@@ -677,6 +683,8 @@ impl Node {
         } else {
             let best = self.chain.best_header();
             eprintln!("headers synchronized with peer {peer}: best header {} at height {}", hash_to_display(&best.hash), best.height);
+            let start_height = self.peers.get(&peer).map_or(0, |p| p.start_height);
+            self.downloads.lock().unwrap().set_ready(peer, start_height);
         }
         self.refresh_wanted();
     }

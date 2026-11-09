@@ -547,7 +547,8 @@ conformance suites and the kill/restart scenario passing after each change. Numb
 | same, under the holdout load | 18 to 31 s |
 | Coin flush (`bitcoin-spec-node bench-flush`): 20 million new coins, then 10 million deletions, into RocksDB as parallel SST files ingested atomically | 2.0 s and 0.9 s; fingerprint of 10 million coins 4.4 s (under load) |
 | Public testnet4, 8 DNS-seed peers | heights 0 to 35,703 in 100 s (about 360 blocks/s) |
-| Public mainnet, DNS-seed peers (short test only) | heights 0 to 31,810 in about 6 minutes; up to 808 blocks/s once headers were ahead; header download from busy public peers (8 parallel header syncs, peers serving blocks at the same time) was the limit, 576,000 headers after 5.5 minutes |
+| Public mainnet, DNS-seed peers (short test only) | first try: heights 0 to 31,810 in about 6 minutes; header download from public peers that were also serving our block requests was the limit (576,000 headers after 5.5 minutes) |
+| same, after making the node request blocks from a peer only once that peer's headers are synchronized (headers first) | all 975,116 headers, then heights 0 to 76,937, in 170 s; about 1,050 blocks/s on the early chain (under load) |
 | Peak memory, regtest benchmark (`--dbcache 1000`) | 1.9 GB resident |
 
 What the profile (`sample`) showed and what changed because of it:
