@@ -91,3 +91,23 @@ blocks persisted above the last flushed tip need an activation of their own. A o
 11.12 ("after loading persisted state, run `activate_best_chain` before waiting for new data; Core:
 `ActivateBestChain` at the end of `LoadChainTip`/init") would have prevented it.
 Status: suggestion only; not a defect.
+
+### F9. PROTOCOL.md section 5 rule 4 versus the runner: `x_` events
+
+PROTOCOL.md 5 (rule 4) says lines whose `event` starts with `x_` are implementation extensions
+that the runner ignores, but the runner's `interop` suite (`run_node` in
+`conformance/runner/src/suites/interop.rs`) reports every event other than `tip` and `stopped` as
+"unexpected line", which fails the chain. My node emits no other event in the interop suite (its
+`utxo_hash` event, which this experiment's instructions name without an `x_` prefix, only appears
+with `--utxo-hash-at`), so this had no effect here. Either the runner or rule 4 should change.
+Status: open (found by reading the runner source).
+
+### F10. Chapter 14 section 14.4: block requests delay header answers (suggestion)
+
+14.4 notes that Bitcoin Core answers `getdata` requests one at a time "and large batches only
+delay other messages". In a short public-mainnet test this was the main limit: peers that were
+serving 16 block requests answered `getheaders` slowly, and the node had only 576,000 headers after
+5.5 minutes. Requesting blocks from a peer only after that peer's header chain is synchronized
+(headers first per peer) gave all 975,116 headers plus 76,937 blocks in 170 s. A sentence in 14.3 or
+14.4 recommending headers-first per peer would help implementers; it is not a consensus matter.
+Status: suggestion.
