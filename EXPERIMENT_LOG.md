@@ -645,7 +645,8 @@ fills. Total memory stays around 14 GB.
 
 ### M5: final results (2026-11-08)
 
-Final runs on commit `2b9cf29` (the build every result below comes from).
+Final runs on commit `1124fb7` (the build every result below comes from; the same runs
+on `2b9cf29`, before the stall handling of bug 5, gave the same counts).
 
 Default suites (`bcs-conformance --impl "target/release/bitcoin-spec-node harness"`), verbatim:
 
@@ -660,15 +661,15 @@ tx-invalid     derived       7197      7197        0        0        7113       
 sighash        -             1000      1000        0        0           0        0     0.0s
 bip341         -               26        26        0        0           7        0     0.0s
 bip340         -               19        19        0        0           0        0     0.0s
-script-assets  derived     239168    239168        0        0      239168        0     9.9s
+script-assets  derived     239168    239168        0        0      239168        0     9.3s
 custom         -               21        21        0        0          20        0     0.0s
-corpus         -             5275      5275        0        0        2288        0     8.0s
+corpus         -             5275      5275        0        0        2288        0     7.7s
 
 corpus file                                   checks  L0 normat.    L0 other   L1 tips   L2 utxo errors     time
 feature_bip68_sequence.node0                      31       31/31         0/0     31/31     29/29      0     0.0s
 feature_bip68_sequence.node1                      13       13/13         0/0     13/13     13/13      0     0.0s
 feature_block.node0                              128     128/128         0/0   104/104     40/40      0     0.1s
-feature_block_reorg.node0                        133     133/133         0/0   104/104     43/43      0     5.9s
+feature_block_reorg.node0                        133     133/133         0/0   104/104     43/43      0     5.7s
 feature_cltv.node0                                11       11/11         0/0     11/11       5/5      0     0.0s
 feature_csv_activation.node0                     139     139/139         0/0     82/82     33/33      0     0.0s
 feature_dersig.node0                               6         6/6         0/0       6/6       4/4      0     0.0s
@@ -679,8 +680,8 @@ feature_segwit.node2                              12       12/12         0/0    
 feature_spec_pitfalls.node0                       37       37/37         0/0     37/37     18/18      0     0.0s
 feature_spec_pitfalls.node1                        7         7/7         0/0       7/7       4/4      0     0.0s
 feature_spec_pitfalls.node2                      147     147/147         0/0   147/147   145/145      0     0.0s
-feature_taproot.node0                           4044   4044/4044         0/0   108/108 1467/1467      0     1.5s
-mining_basic.node0                               375     375/375         0/0   375/375   328/328      0     0.3s
+feature_taproot.node0                           4044   4044/4044         0/0   108/108 1467/1467      0     1.4s
+mining_basic.node0                               375     375/375         0/0   375/375   328/328      0     0.2s
 mining_basic.node1                                 4         3/3         1/1       4/4       4/4      0     0.0s
 p2p_invalid_block.node0                           10       10/10         0/0     10/10       5/5      0     0.0s
 p2p_segwit.node0                                 106     106/106         0/0   106/106     67/67      0     0.1s
@@ -697,45 +698,46 @@ Interop suite (bitcoind v32.1 as a black-box peer, `--port-range 30000-30999`, n
 
 ```text
 suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
-interop        -               20        20        0        0           0        0   378.8s
+interop        -               20        20        0        0           0        0   369.9s
 
 rows without a check in this mode (stated rules, counted):
   interop: 1 x scenario's final chain has blocks dated more than 2 hours after the current time (a live node uses its real clock)
 
 interop chain                                 height   result     time  detail
-generate-300                                     300    match     0.9s  tip 75fa6075001e2e86
-feature_bip68_sequence.node0                     431    match    25.3s  tip 7cf1dee5a139466e
-feature_bip68_sequence.node1                     431    match    25.2s  tip 7cf1dee5a139466e
-feature_block.node0                              134    match     8.6s  tip 11b168bdbe7f2738
-feature_block_reorg.node0                       1224    match    76.4s  tip 79365b55bdbfa159
-feature_cltv.node0                               111    match     7.2s  tip 487ab404b9130a94
-feature_csv_activation.node0                     437    match    25.4s  tip 361301b2b2936959
+generate-300                                     300    match     0.8s  tip 1af713f10afc9466
+feature_bip68_sequence.node0                     431    match    24.1s  tip 7cf1dee5a139466e
+feature_bip68_sequence.node1                     431    match    23.9s  tip 7cf1dee5a139466e
+feature_block.node0                              134    match     8.3s  tip 11b168bdbe7f2738
+feature_block_reorg.node0                       1224    match    72.9s  tip 79365b55bdbfa159
+feature_cltv.node0                               111    match     6.7s  tip 487ab404b9130a94
+feature_csv_activation.node0                     437    match    24.3s  tip 361301b2b2936959
 feature_dersig.node0                             102    match     6.4s  tip 423b43404f22f8c2
-feature_nulldummy.node0                          105    match     6.5s  tip 455727112aee5098
-feature_segwit.node0                             171    match    10.0s  tip 1d06323b25f95532
+feature_nulldummy.node0                          105    match     6.4s  tip 455727112aee5098
+feature_segwit.node0                             171    match     9.9s  tip 1d06323b25f95532
 feature_segwit.node1                             171    match    10.0s  tip 1d06323b25f95532
 feature_segwit.node2                             171    match    10.0s  tip 1d06323b25f95532
 feature_spec_pitfalls.node0                      200    match    11.6s  tip 0d5e6e814ffe90bc
 feature_spec_pitfalls.node1                       11    match     1.4s  tip 00618f4c750252cd
-feature_spec_pitfalls.node2                      144    match     8.6s  tip 46202bbab91a3e22
-feature_taproot.node0                           1565    match    86.1s  tip 035363b53e65c94b
+feature_spec_pitfalls.node2                      144    match     8.5s  tip 46202bbab91a3e22
+feature_taproot.node0                           1565    match    85.7s  tip 035363b53e65c94b
 mining_basic.node0                                 - excluded           
-mining_basic.node1                               367    match    20.7s  tip 00b59fd834cd2e7e
-p2p_invalid_block.node0                          103    match     6.4s  tip 6476b5ef577af9e7
-p2p_segwit.node0                                 268    match    15.7s  tip 025e52c52008615b
-p2p_segwit.node1                                 268    match    15.5s  tip 025e52c52008615b
+mining_basic.node1                               367    match    20.5s  tip 00b59fd834cd2e7e
+p2p_invalid_block.node0                          103    match     6.5s  tip 6476b5ef577af9e7
+p2p_segwit.node0                                 268    match    15.6s  tip 025e52c52008615b
+p2p_segwit.node1                                 268    match    15.3s  tip 025e52c52008615b
 
 RESULT: PASS
 ```
 
 Own regtest scenarios against Bitcoin Core on this build: `sync` (with the output contract check
 of bug 4: one `stopped` line, last, no repeated tip lines), `reorg` (two switches), `restart` (ten
-SIGKILLs during a sync with a 4 MiB coin cache), `storm` (150 steps) and `corrupt_test.py`: all
-match `gettxoutsetinfo` (tip, height, `hash_serialized_3`).
+SIGKILLs during a sync with a 4 MiB coin cache), `storm` (150 steps), `corrupt_test.py` and
+`stall_test.py` (402 blocks in 2.7 s next to a peer that never sends blocks): all match
+`gettxoutsetinfo` (tip, height, `hash_serialized_3`). `cargo test --release` passes.
 
 Summary of the experiment:
 
-| | First run | Final (`2b9cf29`) |
+| | First run | Final (`1124fb7`) |
 |---|---|---|
 | script-tests, tx-valid, tx-invalid, sighash, bip341, bip340, script-assets | all pass, level 2 identical (M1) | all pass, level 2 identical |
 | custom edge cases | 21/21 (M1, own checker) | 21/21 |
