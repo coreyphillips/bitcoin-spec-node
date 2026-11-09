@@ -259,3 +259,69 @@ restarts: 33 (0 skipped by the shortcut, 10781 events re-delivered); harness out
 
 RESULT: PASS
 ```
+
+#### Corpus rerun with `feature_spec_pitfalls` part g
+
+Part g of `feature_spec_pitfalls.node0` (recorded against Core v32.1; it exercises the anti-DoS
+work checks of 14.3/14.4: an unsolicited deep-fork block dropped with `too-little-chainwork`,
+shallower ones kept header-only, a low-work headers message ignored, the same headers with one
+more stored) landed after the runs above. Corpus suite rerun with the post-errata build, verbatim
+(`--fail-on-level2` also exits 0):
+
+```text
+harness: bitcoin-spec-node 0.1.0 (spec v32.1-1), ops: info, script_verify, tx_check, sighash_legacy, sighash_taproot, taproot_commitment_verify, schnorr_verify, chain_reset, chain_process_block, chain_process_headers, chain_invalidate, chain_tip, chain_tips, utxo_hash
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+corpus         -             5121      5121        0        0        2139        0     9.8s
+
+corpus file                                   checks  L0 normat.    L0 other   L1 tips   L2 utxo errors     time
+feature_bip68_sequence.node0                      31       31/31         0/0     31/31     29/29      0     0.0s
+feature_bip68_sequence.node1                      13       13/13         0/0     13/13     13/13      0     0.0s
+feature_block.node0                              128     128/128         0/0   104/104     40/40      0     0.1s
+feature_block_reorg.node0                        133     133/133         0/0   104/104     43/43      0     6.8s
+feature_cltv.node0                                11       11/11         0/0     11/11       5/5      0     0.0s
+feature_csv_activation.node0                     139     139/139         0/0     82/82     33/33      0     0.0s
+feature_dersig.node0                               6         6/6         0/0       6/6       4/4      0     0.0s
+feature_nulldummy.node0                            8         8/8         0/0       8/8       6/6      0     0.0s
+feature_segwit.node0                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node1                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node2                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_spec_pitfalls.node0                       37       37/37         0/0     37/37     18/18      0     0.0s
+feature_taproot.node0                           4044   4044/4044         0/0   108/108 1467/1467      0     2.0s
+mining_basic.node0                               375     375/375         0/0   375/375   328/328      0     0.5s
+mining_basic.node1                                 4         3/3         1/1       4/4       4/4      0     0.0s
+p2p_invalid_block.node0                           10       10/10         0/0     10/10       5/5      0     0.0s
+p2p_segwit.node0                                 106     106/106         0/0   106/106     67/67      0     0.1s
+p2p_segwit.node1                                  41       41/41         0/0     41/41     41/41      0     0.1s
+total (18 files, 16832 events)                  5122   5121/5121         1/1 1076/1076 2139/2139
+restarts: 33 (0 skipped by the shortcut, 10781 events re-delivered); harness outcomes (diagnostic): block:accepted 8018, block:duplicate 2, block:invalid 2882, block:mutated 25, block:temporary 3, headers:accepted 701, headers:invalid 8, invalidate:ok 20
+
+RESULT: PASS
+```
+
+For comparison, the same file against the build from before errata 1 (commit `e6e2de7`) passes
+level 0 but not level 1, because that build stored headers Core drops; verbatim:
+
+```text
+harness: bitcoin-spec-node 0.1.0 (spec v32.1-1), ops: info, script_verify, tx_check, sighash_legacy, sighash_taproot, taproot_commitment_verify, schnorr_verify, chain_reset, chain_process_block, chain_process_headers, chain_invalidate, chain_tip, chain_tips, utxo_hash
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 32 (event 262, line 264, send_blocks_and_test): chain tips differ (9 expected, 10 got); missing [], unexpected [("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 33 (event 264, line 266, send_blocks_and_test): chain tips differ (10 expected, 11 got); missing [], unexpected [("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 34 (event 266, line 268, send_blocks_and_test): chain tips differ (11 expected, 12 got); missing [], unexpected [("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 35 (event 268, line 270, sync_with_ping): chain tips differ (11 expected, 13 got); missing [], unexpected [("4f915cf4e0a55af8028ace7c9a74180816743fbb3883c6d1428d52816038fea1", 55, "headers-only"), ("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 36 (event 270, line 272, sync_with_ping): chain tips differ (12 expected, 13 got); missing [], unexpected [("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+LEVEL1   [corpus] feature_spec_pitfalls.node0 check 37 (event 272, line 274, sync_with_ping): chain tips differ (13 expected, 14 got); missing [], unexpected [("601ae10ece3e78890a598a6812154ec75e93cf0a389d1706a504623a6e974b66", 55, "headers-only")]
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+corpus         -               37        37        0        0          18        0     0.0s
+
+corpus file                                   checks  L0 normat.    L0 other   L1 tips   L2 utxo errors     time
+feature_spec_pitfalls.node0                       37       37/37         0/0     31/37     18/18      0     0.0s
+total (1 files, 273 events)                       37       37/37         0/0     31/37     18/18
+restarts: 0 (0 skipped by the shortcut, 0 events re-delivered); harness outcomes (diagnostic): block:accepted 210, block:invalid 5, block:mutated 1, headers:accepted 19
+non-normative level 0 checks and level 1 (chain tips) are reported only; they never fail the run
+
+RESULT: PASS
+```
+
+So the chapter 14 anti-DoS checks were invisible to the tip (level 0) in this scenario but are
+visible in `getchaintips` (level 1).
