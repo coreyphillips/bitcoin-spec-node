@@ -117,9 +117,23 @@ impl CoinDb for RocksCoinDb {
         if outpoints.len() < 64 {
             return outpoints.iter().map(|op| self.get(op)).collect();
         }
-        // Reads run on their own pool: on the global pool they would queue behind the script
-        // checks of earlier blocks, and the chain thread waits for them.
-        io_pool().install(|| outpoints.par_iter().with_min_len(16).map(|op| self.get(op)).collect())
+        // Reads run on their own pool (on the global pool they would queue behind the script
+        // checks of earlier blocks), in chunks of keys looked up with RocksDB's batched MultiGet.
+        let cf = self.db.cf_handle(CF_COINS).expect("coins column family");
+        let sorted = outpoints.windows(2).all(|pair| pair[0] <= pair[1]);
+        io_pool().install(|| {
+            outpoints
+                .par_chunks(256)
+                .flat_map_iter(|chunk| {
+                    let keys: Vec<[u8; 36]> = chunk.iter().map(outpoint_key).collect();
+                    self.db
+                        .batched_multi_get_cf(&cf, keys.iter(), sorted)
+                        .into_iter()
+                        .map(|value| value.expect("coin database read failed").map(|v| decode_coin(&v).expect("corrupt coin record")))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
     }
 
     fn write(&mut self, changes: &mut dyn Iterator<Item = (OutPoint, Option<CoinRef<'_>>)>, best: &Hash256) -> io::Result<()> {
