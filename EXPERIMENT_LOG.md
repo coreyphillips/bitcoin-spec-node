@@ -531,6 +531,32 @@ RESULT: PASS
 ```
 
 
+### More live checks (2026-11-08)
+
+- `headers-live` on testnet3 (runner suite, public peer found through a DNS seed; the first peer
+  closed the connection and the runner reconnected to another), verbatim summary:
+
+  ```text
+  suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+  headers-live   -             2654      2654        0        0           0        0   272.6s
+
+  headers-live: network testnet3, peer 44.238.21.47:18333 (/btcwire:0.5.0/btcd:0.27.0/, protocol 70016, start height 5303811)
+  headers-live: 5303811 headers in 2652 messages, last header 0000000000c9ba9e2ea180982b2cb788947ebff0c705591cbb189bb754a168a5 at height 5303811, chainwork 00000000000000000000000000000000000000000000180efd396d2e6e92a0e5, 273 s
+
+  RESULT: PASS
+  ```
+
+- Reorganization storm against Bitcoin Core (`tools/regtest.py storm`): Core builds a chain with
+  wallet and `bsn-txgen` activity, then repeatedly invalidates a recent block (depth 1 to 8), adds
+  wallet transactions and mines a longer branch, sometimes reconsidering an old branch; the node
+  must be at Core's tip after every step, and after a restart its UTXO set must match
+  `gettxoutsetinfo`. 25 steps (seed 13): match. 150 steps (seed 7; 105 reorganizations: depth 1 x
+  11, 2 x 24, 3 x 11, 4 x 15, 5 x 14, 6 x 11, 7 x 11, 8 x 8; 45 reconsiders): match at height 581.
+  The first attempt failed in the test itself: Core refused a mined block identical to the one it
+  had just invalidated (same coinbase script, same transactions), so each step now mines to a
+  coinbase script of its own.
+- Damaged block files after a kill (`tools/corrupt_test.py`): see bug 3 below; match after the fix.
+
 ### M4: performance and memory (2026-11-08)
 
 Measurements on the Apple M5 Pro (6 performance + 12 efficiency cores, 64 GB), all with the
@@ -549,6 +575,7 @@ conformance suites and the kill/restart scenario passing after each change. Numb
 | Public testnet4, 8 DNS-seed peers | heights 0 to 35,703 in 100 s (about 360 blocks/s) |
 | Public mainnet, DNS-seed peers (short test only) | first try: heights 0 to 31,810 in about 6 minutes; header download from public peers that were also serving our block requests was the limit (576,000 headers after 5.5 minutes) |
 | same, after making the node request blocks from a peer only once that peer's headers are synchronized (headers first) | all 975,116 headers, then heights 0 to 76,937, in 170 s; about 1,050 blocks/s on the early chain (under load) |
+| Coin prefetch (`bench-flush`, 10 million coins read back from RocksDB on a 16-thread read pool): one `get` per coin against batched `MultiGet` in chunks of 256 sorted keys, alternating runs | single gets 8.3, 4.7, 9.5, 8.2 s; `MultiGet` 5.8, 5.9, 4.4, 3.4 s (kept) |
 | Peak memory, regtest benchmark (`--dbcache 1000`) | 1.9 GB resident |
 
 What the profile (`sample`) showed and what changed because of it:

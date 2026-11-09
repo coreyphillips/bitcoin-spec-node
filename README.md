@@ -154,6 +154,7 @@ regtest (ports 30700-30799, data under `test-data/regtest/`) and compares the no
 python3 -I tools/regtest.py sync blocks=300 txs=300   # chain built by bsn-txgen, synced from genesis
 python3 -I tools/regtest.py reorg                     # follow new blocks, two reorganizations
 python3 -I tools/regtest.py restart kills=10          # SIGKILL at random moments during a sync
+python3 -I tools/regtest.py storm steps=150           # reorganizations of depth 1 to 8, then a restart
 python3 -I tools/regtest.py bench                     # time a sync of a large chain (built once)
 python3 -I tools/corrupt_test.py                      # kill, damage the newest block files, restart
 ```

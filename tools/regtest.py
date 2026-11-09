@@ -322,6 +322,71 @@ def scenario_restart(args):
         core.stop()
 
 
+def scenario_storm(args):
+    """The node follows Core through many reorganizations of random depth (Core invalidates a
+    recent block and mines a longer fork, which picks up the disconnected transactions from its
+    mempool; sometimes the old branch is reconsidered), then restarts and compares its UTXO set."""
+    core = Core("core-storm", 30741, 30742)
+    node = Node("node-storm")
+    rng = random.Random(args.get("seed", 13))
+    try:
+        core.start()
+        make_chain(core, blocks=args.get("blocks", 150), txs=args.get("txs", 60), seed=21, wallet_rounds=2)
+        node.reset()
+        node.start(30741)
+
+        def wait_node_at(tip, timeout):
+            # The node reports every tip change on regtest, so its last tip event is its tip.
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                last = node.last_tip()
+                if last and last["tip"] == tip:
+                    return
+                if node.process.poll() is not None:
+                    raise RuntimeError(f"node exited with status {node.process.returncode}")
+                time.sleep(0.05)
+            raise RuntimeError(f"node did not reach {tip}")
+
+        tip, height = core.tip()
+        wait_node_at(tip, 300)
+        invalidated = []
+        for step in range(args.get("steps", 25)):
+            tip, height = core.tip()
+            if invalidated and rng.random() < 0.25:
+                block = invalidated.pop(rng.randrange(len(invalidated)))
+                core.rpc("reconsiderblock", block)
+                action = "reconsider"
+            else:
+                depth = rng.randint(1, 8)
+                block = core.rpc("getblockhash", height - depth + 1)
+                core.rpc("invalidateblock", block)
+                invalidated.append(block)
+                # Spend some coins so the new branch differs, then outgrow the old branch.
+                try:
+                    for _ in range(rng.randint(0, 6)):
+                        address = core.rpc("getnewaddress", "", rng.choice(["bech32", "bech32m", "legacy"]), wallet="w")
+                        core.rpc("sendtoaddress", address, round(rng.uniform(0.01, 0.3), 8), wallet="w")
+                except RuntimeError:
+                    pass
+                # A coinbase script of its own per step: a block identical to the invalidated
+                # one would be refused by Core as known invalid. Each new tip is higher than every
+                # earlier block, so the node must follow it (regtest blocks have equal work).
+                core.rpc("generatetodescriptor", depth + rng.randint(1, 3), f"raw(01{step % 256:02x}7551)")
+                action = f"invalidate depth {depth}"
+            tip, height = core.tip()
+            wait_node_at(tip, 120)
+            log(f"storm step {step + 1}: {action}; core and node at {height}")
+        node.terminate()
+        tip, height = core.tip()
+        node.start(30741, stop_at=tip)
+        event = node.wait_for(lambda e: e.get("event") == "stopped", 120)
+        node.wait_exit()
+        return compare(core, event, "storm")
+    finally:
+        node.kill()
+        core.stop()
+
+
 def scenario_bench(args):
     """Builds (once) a large chain on Core and measures how fast the node synchronizes it."""
     core = Core("core-bench", 30731, 30732)
@@ -366,6 +431,8 @@ def main():
         results["restart"] = scenario_restart(args)
     if scenario == "bench":
         results["bench"] = scenario_bench(args)
+    if scenario in ("storm", "all"):
+        results["storm"] = scenario_storm(args)
     log(f"results: {results}")
     return 0 if all(results.values()) else 1
 
