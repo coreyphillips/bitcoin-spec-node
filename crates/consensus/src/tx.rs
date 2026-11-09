@@ -337,6 +337,12 @@ pub struct BlockData {
     pub stripped_size: usize,
     /// Length of the block serialized with witness data (trailing bytes excluded).
     pub total_size: usize,
+    /// Merkle root of the txids and the mutation flag, once computed (a pure cache).
+    pub merkle: std::sync::OnceLock<(Hash256, bool)>,
+    /// Witness merkle root, once computed (a pure cache).
+    pub witness_merkle: std::sync::OnceLock<Hash256>,
+    /// Legacy signature operation count of each transaction, once computed (a pure cache).
+    pub legacy_sigops: std::sync::OnceLock<Vec<u64>>,
 }
 
 impl BlockData {
@@ -351,7 +357,7 @@ impl BlockData {
         let stripped_size = 80 + count_len + tx_info.iter().map(|info| info.stripped_size).sum::<usize>();
         let total_size = 80 + count_len + tx_info.iter().map(|info| info.total_size).sum::<usize>();
         let hash = block.header.hash();
-        BlockData { block, hash, tx_info, stripped_size, total_size }
+        BlockData { block, hash, tx_info, stripped_size, total_size, merkle: std::sync::OnceLock::new(), witness_merkle: std::sync::OnceLock::new(), legacy_sigops: std::sync::OnceLock::new() }
     }
 
     /// Core: `GetBlockWeight`.

@@ -51,17 +51,24 @@ pub fn compute_merkle_root(mut hashes: Vec<Hash256>) -> (Hash256, bool) {
 
 /// Core: `BlockMerkleRoot`.
 pub fn block_merkle_root(block: &BlockData) -> (Hash256, bool) {
-    compute_merkle_root(block.tx_info.iter().map(|info| info.txid).collect())
+    *block.merkle.get_or_init(|| compute_merkle_root(block.tx_info.iter().map(|info| info.txid).collect()))
 }
 
 /// Core: `BlockWitnessMerkleRoot`.
 pub fn block_witness_merkle_root(block: &BlockData) -> Hash256 {
-    let mut leaves = Vec::with_capacity(block.tx_info.len());
-    leaves.push(ZERO_HASH);
-    for info in block.tx_info.iter().skip(1) {
-        leaves.push(info.wtxid);
-    }
-    compute_merkle_root(leaves).0
+    *block.witness_merkle.get_or_init(|| {
+        let mut leaves = Vec::with_capacity(block.tx_info.len());
+        leaves.push(ZERO_HASH);
+        for info in block.tx_info.iter().skip(1) {
+            leaves.push(info.wtxid);
+        }
+        compute_merkle_root(leaves).0
+    })
+}
+
+/// The legacy signature operation count of each transaction (cached in the block).
+pub fn block_legacy_sigops(block: &BlockData) -> &[u64] {
+    block.legacy_sigops.get_or_init(|| block.block.transactions.iter().map(legacy_sig_op_count).collect())
 }
 
 /// Core: `MINIMUM_WITNESS_COMMITMENT`.
@@ -174,7 +181,7 @@ pub fn check_block(block: &BlockData, params: &ConsensusParams) -> Result<(), Fa
     for (tx, info) in transactions.iter().zip(&block.tx_info) {
         check_transaction_sized(tx, info.stripped_size).map_err(invalid)?;
     }
-    let sigops: u64 = transactions.iter().map(legacy_sig_op_count).sum();
+    let sigops: u64 = block_legacy_sigops(block).iter().sum();
     if sigops as i64 * WITNESS_SCALE_FACTOR as i64 > MAX_BLOCK_SIGOPS_COST {
         return Err(invalid("bad-blk-sigops"));
     }

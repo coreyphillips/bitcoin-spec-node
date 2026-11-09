@@ -543,9 +543,14 @@ impl<S: ChainStore> ChainState<S> {
     /// several blocks at once may store them all and activate once: the chain then selected is the
     /// same, and connecting several blocks in one activation lets their script checks overlap.
     pub fn store_block(&mut self, block: Arc<BlockData>, now: i64, requested: bool) -> BlockOutcome {
-        let started = std::time::Instant::now();
         let checked = check_block(&block, &self.params.consensus);
-        timing::add(&timing::CHECKS_NS, started);
+        self.store_checked_block(block, checked, now, requested)
+    }
+
+    /// `store_block` for a block whose context-free checks (`check_block`, which depends only on
+    /// the block and the network parameters) were already run, for example in parallel.
+    pub fn store_checked_block(&mut self, block: Arc<BlockData>, checked: Result<(), Failure>, now: i64, requested: bool) -> BlockOutcome {
+        let started = std::time::Instant::now();
         if let Err(failure) = checked {
             return BlockOutcome::Rejected(failure);
         }
@@ -575,6 +580,7 @@ impl<S: ChainStore> ChainState<S> {
                 None => contextual_check_block(&block, None, &self.params.consensus),
             }
         };
+        timing::add(&timing::CHECKS_NS, started);
         if let Err(failure) = result {
             if failure.kind != FailureKind::Mutated {
                 self.mark_invalid(id);
@@ -692,6 +698,7 @@ impl<S: ChainStore> ChainState<S> {
     fn commit(&mut self, pending: PendingBlock) {
         let started = std::time::Instant::now();
         let PendingBlock { id, block, changes, undo, .. } = pending;
+        let undo = Arc::try_unwrap(undo).unwrap_or_else(|shared| (*shared).clone());
         let coins = self.store.coins();
         changes.apply(coins);
         coins.best_block = block.hash;
@@ -1048,11 +1055,11 @@ struct TxScriptData {
     precomputed: PrecomputedTx,
 }
 
-/// A block prepared for connection: its UTXO changes, undo data, and what its script checks need.
+/// A block prepared for connection: its UTXO changes, undo data (the spent coins, which are also
+/// what its script checks need), and the script flags.
 pub struct PreparedBlock {
     changes: BlockChanges,
-    undo: BlockUndo,
-    script_data: Vec<Option<TxScriptData>>,
+    undo: Arc<BlockUndo>,
     flags: u32,
 }
 
@@ -1061,18 +1068,22 @@ struct PendingBlock {
     id: EntryId,
     block: Arc<BlockData>,
     changes: BlockChanges,
-    undo: BlockUndo,
+    undo: Arc<BlockUndo>,
     scripts: std::sync::mpsc::Receiver<Option<ScriptError>>,
 }
 
 impl PendingBlock {
     fn start(id: EntryId, block: Arc<BlockData>, prepared: PreparedBlock) -> PendingBlock {
-        let PreparedBlock { changes, undo, script_data, flags } = prepared;
+        let PreparedBlock { changes, undo, flags } = prepared;
         let (sender, receiver) = std::sync::mpsc::channel();
         let job_block = block.clone();
+        let job_undo = undo.clone();
         rayon::spawn(move || {
             let started = std::time::Instant::now();
-            let result = verify_block_scripts(&job_block.block.transactions, &script_data, flags);
+            let result = verify_block_scripts(&job_block.block.transactions, &job_undo, flags);
+            // Release the shared data before reporting, so that the committer owns it again.
+            drop(job_undo);
+            drop(job_block);
             timing::add(&timing::SCRIPTS_NS, started);
             let _ = sender.send(result);
         });
@@ -1092,10 +1103,10 @@ impl PendingBlock {
 /// On success returns the changes to apply and the undo data. Core: `ConnectBlock`.
 pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &mut CoinsCache, params: &NetworkParams) -> Result<(BlockChanges, BlockUndo), Failure> {
     let prepared = prepare_block(block, id, tree, coins, &[], params)?;
-    if let Some(error) = verify_block_scripts(&block.block.transactions, &prepared.script_data, prepared.flags) {
+    if let Some(error) = verify_block_scripts(&block.block.transactions, &prepared.undo, prepared.flags) {
         return Err(invalid(&format!("block-script-verify-flag-failed ({})", error.message())));
     }
-    Ok((prepared.changes, prepared.undo))
+    Ok((prepared.changes, Arc::try_unwrap(prepared.undo).unwrap_or_else(|shared| (*shared).clone())))
 }
 
 /// Everything `ConnectBlock` checks except the scripts (chapter 10 section 10.8 steps 1 to 4),
@@ -1107,7 +1118,7 @@ pub fn prepare_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
     let mut changes = BlockChanges::new();
     let flags = block_script_flags(&entry.hash, entry.height, consensus);
     if entry.hash == consensus.genesis_hash {
-        return Ok(PreparedBlock { changes, undo: Vec::new(), script_data: Vec::new(), flags });
+        return Ok(PreparedBlock { changes, undo: Arc::new(Vec::new()), flags });
     }
     let height = entry.height;
     let parent_id = entry.parent.expect("non-genesis block has a parent");
@@ -1157,7 +1168,7 @@ pub fn prepare_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
     let mut fees: i64 = 0;
     let mut sigops_cost: i64 = 0;
     let mut undo: BlockUndo = Vec::with_capacity(transactions.len().saturating_sub(1));
-    let mut script_data: Vec<Option<TxScriptData>> = Vec::with_capacity(transactions.len());
+    let legacy_sigops = block_legacy_sigops(block);
 
     for (tx_index, tx) in transactions.iter().enumerate() {
         let is_coinbase = tx.is_coinbase();
@@ -1179,16 +1190,11 @@ pub fn prepare_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
             spent
         };
         let spent_refs: Vec<&TxOut> = spent.iter().map(|coin| &coin.output).collect();
-        sigops_cost += transaction_sig_op_cost(tx, &spent_refs, flags);
+        sigops_cost += transaction_sig_op_cost_with_legacy(tx, &spent_refs, flags, legacy_sigops[tx_index]);
         if sigops_cost > MAX_BLOCK_SIGOPS_COST {
             return Err(invalid("bad-blk-sigops"));
         }
-        if is_coinbase {
-            script_data.push(None);
-        } else {
-            let spent_outputs: Vec<TxOut> = spent.iter().map(|coin| coin.output.clone()).collect();
-            let precomputed = PrecomputedTx::new(tx, &spent_outputs);
-            script_data.push(Some(TxScriptData { spent_outputs, precomputed }));
+        if !is_coinbase {
             for input in &tx.inputs {
                 changes.spend(&input.prevout);
             }
@@ -1222,21 +1228,29 @@ pub fn prepare_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
         return Err(invalid("bad-cb-amount"));
     }
     timing::add(&timing::SERIAL_NS, started);
-    Ok(PreparedBlock { changes, undo, script_data, flags })
+    Ok(PreparedBlock { changes, undo: Arc::new(undo), flags })
 }
 
 /// Runs every input's script check in parallel and returns the error of the first failing input
-/// in block order (the reference runs them in order and stops at the first failure).
-fn verify_block_scripts(transactions: &[Transaction], script_data: &[Option<TxScriptData>], flags: u32) -> Option<ScriptError> {
-    let jobs: Vec<(u32, u32)> = script_data
-        .iter()
-        .enumerate()
-        .filter_map(|(tx_index, data)| data.as_ref().map(|_| tx_index))
-        .flat_map(|tx_index| (0..transactions[tx_index].inputs.len() as u32).map(move |input| (tx_index as u32, input)))
-        .collect();
+/// in block order (the reference runs them in order and stops at the first failure). `undo[i]`
+/// holds the coins spent by the non-coinbase transaction `i + 1`.
+fn verify_block_scripts(transactions: &[Transaction], undo: &BlockUndo, flags: u32) -> Option<ScriptError> {
+    // The outputs each transaction spends, and its signature hash cache.
+    let build = |tx_index: usize| -> TxScriptData {
+        let spent_outputs: Vec<TxOut> = undo[tx_index - 1].iter().map(|coin| coin.output.clone()).collect();
+        let precomputed = PrecomputedTx::new(&transactions[tx_index], &spent_outputs);
+        TxScriptData { spent_outputs, precomputed }
+    };
+    let total_inputs: usize = transactions.iter().skip(1).map(|tx| tx.inputs.len()).sum();
+    let script_data: Vec<TxScriptData> = if total_inputs < 16 {
+        (1..transactions.len()).map(build).collect()
+    } else {
+        (1..transactions.len()).into_par_iter().with_min_len(8).map(build).collect()
+    };
+    let jobs: Vec<(u32, u32)> = (1..transactions.len()).flat_map(|tx_index| (0..transactions[tx_index].inputs.len() as u32).map(move |input| (tx_index as u32, input))).collect();
     let check = |&(tx_index, input_index): &(u32, u32)| -> Option<ScriptError> {
         let tx = &transactions[tx_index as usize];
-        let data = script_data[tx_index as usize].as_ref().unwrap();
+        let data = &script_data[tx_index as usize - 1];
         verify_input(tx, input_index as usize, &data.spent_outputs, &data.precomputed, flags).err()
     };
     if jobs.len() < 16 {

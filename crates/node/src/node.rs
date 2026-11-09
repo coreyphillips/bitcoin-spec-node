@@ -11,7 +11,7 @@
 use crate::downloads::{DownloadState, Downloads};
 use crate::net::{connect, NetEvent};
 use crate::store::{load_index, utxo_hash_of_database, DiskStore, Hooks, IndexRecord};
-use consensus::block_rules::is_block_mutated;
+use consensus::block_rules::{block_witness_merkle_root, check_block, is_block_mutated};
 use consensus::chain::{headers_message_acceptable, p2p_block_work_acceptable, BlockEntry, BlockOutcome, BlockTree, ChainState, EntryId, HeaderError, HeadersRejection};
 use consensus::p2p::*;
 use consensus::params::{Network, NetworkOptions, NetworkParams};
@@ -443,11 +443,17 @@ impl Node {
                     Err(_) => break,
                 }
             }
-            // Decode blocks in parallel, keeping arrival order.
-            let decoded: Vec<Option<BlockData>> = batch
+            // Decode blocks in parallel, keeping arrival order, together with the work that needs
+            // nothing but the block: merkle roots and the context-free checks (`check_block`).
+            let consensus = &self.chain.params.consensus;
+            let decoded: Vec<Option<(BlockData, Result<(), consensus::util::Failure>)>> = batch
                 .par_iter()
                 .map(|event| match event {
-                    NetEvent::Message { command, payload, .. } if command == "block" => deserialize_block_data(payload).ok(),
+                    NetEvent::Message { command, payload, .. } if command == "block" => deserialize_block_data(payload).ok().map(|data| {
+                        let checked = check_block(&data, consensus);
+                        block_witness_merkle_root(&data);
+                        (data, checked)
+                    }),
                     _ => None,
                 })
                 .collect();
@@ -458,8 +464,8 @@ impl Node {
                 match event {
                     NetEvent::Message { peer, command, requested, .. } if command == "block" => {
                         match block {
-                            Some(data) => {
-                                self.handle_block(peer, data, requested);
+                            Some((data, checked)) => {
+                                self.handle_block(peer, data, checked, requested);
                                 stored = true;
                             }
                             None => eprintln!("peer {peer}: block message does not decode"),
@@ -671,7 +677,7 @@ impl Node {
 
     /// Stores a block received from a peer (chapter 14 section 14.4, then chapter 11 section 11.6
     /// steps 1 to 6; activation runs once per batch).
-    fn handle_block(&mut self, peer: usize, data: BlockData, requested: bool) {
+    fn handle_block(&mut self, peer: usize, data: BlockData, checked: Result<(), consensus::util::Failure>, requested: bool) {
         self.last_progress = Instant::now();
         if let Some(parent) = self.chain.tree.lookup(&data.block.header.prev_block) {
             let segwit_active = self.chain.tree.get(parent).height + 1 >= self.chain.params.consensus.segwit_height;
@@ -686,7 +692,7 @@ impl Node {
         }
         let hash = data.hash;
         let txs = data.block.transactions.len() as u64;
-        match self.chain.store_block(Arc::new(data), unix_now(), requested) {
+        match self.chain.store_checked_block(Arc::new(data), checked, unix_now(), requested) {
             BlockOutcome::Rejected(failure) => {
                 eprintln!("block {} rejected: {} ({:?})", hash_to_display(&hash), failure.reason, failure.kind);
                 if failure.kind == FailureKind::Invalid && self.config.stop_at.is_some() && !self.stop_reached() {

@@ -489,3 +489,43 @@ mainnet syncs are the experiment owner's holdout runs): headers to 159,961 in se
 validated to height 35,703 in 100 s with 8 peers, no block rejected; then a restart (resumed from
 the flushed state at 35,829), a SIGKILL at 47,219 and another restart, which resumed from 35,829
 again (the last flush), as designed.
+
+#### Interop with 20 corpus files (2026-11-08)
+
+Interop rerun with the 20-file corpus and the build of commit `7ddd347` (batched activation,
+pipelined script checks, download refills from reader threads, DNS-seed discovery), verbatim
+(progress lines omitted):
+
+```text
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+interop        -               20        20        0        0           0        0   399.4s
+
+rows without a check in this mode (stated rules, counted):
+  interop: 1 x scenario's final chain has blocks dated more than 2 hours after the current time (a live node uses its real clock)
+
+interop chain                                 height   result     time  detail
+generate-300                                     300    match     0.9s  tip 7f6d7ac889e85289
+feature_bip68_sequence.node0                     431    match    25.8s  tip 7cf1dee5a139466e
+feature_bip68_sequence.node1                     431    match    25.3s  tip 7cf1dee5a139466e
+feature_block.node0                              134    match     8.9s  tip 11b168bdbe7f2738
+feature_block_reorg.node0                       1224    match    81.2s  tip 79365b55bdbfa159
+feature_cltv.node0                               111    match     7.2s  tip 487ab404b9130a94
+feature_csv_activation.node0                     437    match    26.0s  tip 361301b2b2936959
+feature_dersig.node0                             102    match     6.7s  tip 423b43404f22f8c2
+feature_nulldummy.node0                          105    match     7.0s  tip 455727112aee5098
+feature_segwit.node0                             171    match    10.8s  tip 1d06323b25f95532
+feature_segwit.node1                             171    match    10.7s  tip 1d06323b25f95532
+feature_segwit.node2                             171    match    10.8s  tip 1d06323b25f95532
+feature_spec_pitfalls.node0                      200    match    12.4s  tip 0d5e6e814ffe90bc
+feature_spec_pitfalls.node1                       11    match     1.5s  tip 00618f4c750252cd
+feature_spec_pitfalls.node2                      144    match     9.0s  tip 46202bbab91a3e22
+feature_taproot.node0                           1565    match    92.0s  tip 035363b53e65c94b
+mining_basic.node0                                 - excluded           
+mining_basic.node1                               367    match    22.1s  tip 00b59fd834cd2e7e
+p2p_invalid_block.node0                          103    match     6.8s  tip 6476b5ef577af9e7
+p2p_segwit.node0                                 268    match    16.6s  tip 025e52c52008615b
+p2p_segwit.node1                                 268    match    16.4s  tip 025e52c52008615b
+
+RESULT: PASS
+```
