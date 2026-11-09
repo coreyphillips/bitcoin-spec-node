@@ -325,3 +325,83 @@ RESULT: PASS
 
 So the chapter 14 anti-DoS checks were invisible to the tip (level 0) in this scenario but are
 visible in `getchaintips` (level 1).
+
+### M3: the live node on regtest against Bitcoin Core (2026-11-08)
+
+`bitcoin-spec-node run` (crates/node): one thread owns the chain state and handles peer messages
+in arrival order; block payloads are decoded in parallel before they reach it; headers first, then
+blocks along the best header chain (16 in flight per peer), `MSG_WITNESS_BLOCK` requests, ping
+answered by the reader thread. Persistence: RocksDB (coins, block index) plus one file per block and
+per undo record; the coin cache is flushed as one sorted SST file ingested atomically together with
+the best-block record, after the block index and the block/undo files it depends on are durable.
+
+Own regtest scenarios (`tools/regtest.py`, Bitcoin Core v32.1 as a black box on ports 30700-30799,
+chains built by `tools/txgen`, which signs P2PKH, P2WPKH, P2SH-P2WPKH, P2WSH and P2TR spends with
+its own keys and submits blocks with `submitblock`):
+
+- `sync`: 513 blocks with about 90,000 transactions, synced from genesis in 0.9 s; tip and
+  `hash_serialized_3` match Core's `gettxoutsetinfo`.
+- `reorg`: the node follows new blocks, then Core invalidates 6 blocks and builds a longer fork
+  (node reorganizes), then a second switch; both final states match Core.
+- `restart`: 1,602 blocks with about 225,000 transactions, the node killed with SIGKILL ten times
+  (four of them mid-sync, at heights 573, 760, 1,343 and 1,475) with a 4 MiB coin cache (so it
+  flushes every few blocks), then restarted with `--stop-at`; tip and hash match.
+
+First run of the package's `interop` suite (bitcoind v32.1 as a black-box peer without noban,
+`--port-range 30000-30999`, node command `bitcoin-spec-node run --network {network} --datadir
+{datadir} --connect {peer} --stop-at {stop_at} --options {options}`), before any fix,
+verbatim:
+
+```text
+interop: generate-300 (1 of 19)
+interop: feature_bip68_sequence.node0 (2 of 19)
+interop: feature_bip68_sequence.node1 (3 of 19)
+interop: feature_block.node0 (4 of 19)
+interop: feature_block_reorg.node0 (5 of 19)
+interop: feature_cltv.node0 (6 of 19)
+interop: feature_csv_activation.node0 (7 of 19)
+interop: feature_dersig.node0 (8 of 19)
+interop: feature_nulldummy.node0 (9 of 19)
+interop: feature_segwit.node0 (10 of 19)
+interop: feature_segwit.node1 (11 of 19)
+interop: feature_segwit.node2 (12 of 19)
+interop: feature_spec_pitfalls.node0 (13 of 19)
+interop: feature_taproot.node0 (14 of 19)
+interop: mining_basic.node0 (15 of 19)
+interop: mining_basic.node1 (16 of 19)
+interop: p2p_invalid_block.node0 (17 of 19)
+interop: p2p_segwit.node0 (18 of 19)
+interop: p2p_segwit.node1 (19 of 19)
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+interop        -               18        18        0        0           0        0   385.8s
+
+rows without a check in this mode (stated rules, counted):
+  interop: 1 x scenario's final chain has blocks dated more than 2 hours after the current time (a live node uses its real clock)
+
+interop chain                                 height   result     time  detail
+generate-300                                     300    match     0.9s  tip 1b0f12349312197e
+feature_bip68_sequence.node0                     431    match    25.9s  tip 7cf1dee5a139466e
+feature_bip68_sequence.node1                     431    match    25.9s  tip 7cf1dee5a139466e
+feature_block.node0                              134    match     8.8s  tip 11b168bdbe7f2738
+feature_block_reorg.node0                       1224    match    77.5s  tip 79365b55bdbfa159
+feature_cltv.node0                               111    match     7.3s  tip 487ab404b9130a94
+feature_csv_activation.node0                     437    match    26.1s  tip 361301b2b2936959
+feature_dersig.node0                             102    match     6.8s  tip 423b43404f22f8c2
+feature_nulldummy.node0                          105    match     6.8s  tip 455727112aee5098
+feature_segwit.node0                             171    match    10.7s  tip 1d06323b25f95532
+feature_segwit.node1                             171    match    10.8s  tip 1d06323b25f95532
+feature_segwit.node2                             171    match    10.7s  tip 1d06323b25f95532
+feature_spec_pitfalls.node0                      200    match    12.6s  tip 56b13b712aebeddf
+feature_taproot.node0                           1565    match    91.4s  tip 035363b53e65c94b
+mining_basic.node0                                 - excluded           
+mining_basic.node1                               367    match    22.3s  tip 00b59fd834cd2e7e
+p2p_invalid_block.node0                          103    match     7.0s  tip 6476b5ef577af9e7
+p2p_segwit.node0                                 268    match    16.7s  tip 025e52c52008615b
+p2p_segwit.node1                                 268    match    16.5s  tip 025e52c52008615b
+
+RESULT: PASS
+```
+
+All 18 chains match (tip, height, `hash_serialized_3`) and bitcoind logged no `Misbehaving` line;
+`mining_basic.node0` is excluded by the runner's stated rule (blocks dated in the future).

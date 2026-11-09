@@ -600,15 +600,23 @@ impl Node {
         if self.last_stats.elapsed() >= Duration::from_secs(10) {
             let seconds = self.last_stats.elapsed().as_secs_f64();
             let tip = self.chain.tip();
+            let (phases, inputs) = consensus::chain::timing::take();
             eprintln!(
-                "height {} ({} headers): {:.1} blocks/s, {:.0} tx/s; in flight {}; cache {} MiB, {} entries",
+                "height {} ({} headers): {:.1} blocks/s, {:.0} tx/s, {:.0} inputs/s; in flight {}; cache {} MiB, {} entries; ms checks {} prefetch {} serial {} scripts {} wait {} apply {}",
                 tip.height,
                 self.chain.best_header().height,
                 self.stats_blocks as f64 / seconds,
                 self.stats_txs as f64 / seconds,
+                inputs as f64 / seconds,
                 self.in_flight.len(),
                 self.chain.store.coins_usage() >> 20,
-                self.chain.store.coins_entries()
+                self.chain.store.coins_entries(),
+                phases[0],
+                phases[1],
+                phases[2],
+                phases[3],
+                phases[4],
+                phases[5]
             );
             self.last_stats = Instant::now();
             self.stats_blocks = 0;

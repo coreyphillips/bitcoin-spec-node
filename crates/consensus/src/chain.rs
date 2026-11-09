@@ -27,6 +27,31 @@ use std::sync::Arc;
 /// Index of an entry in the block tree arena.
 pub type EntryId = u32;
 
+/// Cumulative time spent in the phases of block processing (for performance reports only).
+pub mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CHECKS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREFETCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SERIAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SCRIPTS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INPUTS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn add(counter: &AtomicU64, since: std::time::Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// (checks, prefetch, serial, scripts, wait, apply) in milliseconds, and inputs; resets the
+    /// counters. `scripts` is the wall time of the (overlapping) script verifications, `wait` the time
+    /// the chain thread waited for them.
+    pub fn take() -> ([u64; 6], u64) {
+        let ms = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) / 1_000_000;
+        ([ms(&CHECKS_NS), ms(&PREFETCH_NS), ms(&SERIAL_NS), ms(&SCRIPTS_NS), ms(&WAIT_NS), ms(&APPLY_NS)], INPUTS.swap(0, Ordering::Relaxed))
+    }
+}
+
 /// Core: `CBlockIndex`.
 #[derive(Clone, Debug)]
 pub struct BlockEntry {
@@ -225,7 +250,14 @@ pub struct ChainState<S: ChainStore> {
     /// with less chain work are reduced to their header (section 11.6 step 4), and it floors the
     /// anti-denial-of-service work threshold of chapter 14. Zero, the regtest default, unless set.
     pub minimum_chain_work: U256,
+    /// Blocks whose scripts may be verified while later blocks of the same path are prepared
+    /// (1 connects strictly one block at a time). Commits always happen in order, so the result is
+    /// the same for any depth.
+    pub pipeline_depth: usize,
 }
+
+/// Default `pipeline_depth`.
+pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 
 impl<S: ChainStore> ChainState<S> {
     /// A chain with only the genesis block.
@@ -266,6 +298,7 @@ impl<S: ChainStore> ChainState<S> {
             best_header: id,
             halted: false,
             minimum_chain_work: U256::ZERO,
+            pipeline_depth: DEFAULT_PIPELINE_DEPTH,
         }
     }
 
@@ -322,6 +355,7 @@ impl<S: ChainStore> ChainState<S> {
             best_header: 0,
             halted: false,
             minimum_chain_work: U256::ZERO,
+            pipeline_depth: DEFAULT_PIPELINE_DEPTH,
         };
         state.recalculate_best_header();
         let tip = state.tree.tip();
@@ -483,7 +517,10 @@ impl<S: ChainStore> ChainState<S> {
     /// Core: `ChainstateManager::ProcessNewBlock`. `requested` is false only for blocks a peer sent
     /// without being asked; block submission by an operator counts as requested.
     pub fn process_block(&mut self, block: Arc<BlockData>, now: i64, requested: bool) -> BlockOutcome {
-        if let Err(failure) = check_block(&block, &self.params.consensus) {
+        let started = std::time::Instant::now();
+        let checked = check_block(&block, &self.params.consensus);
+        timing::add(&timing::CHECKS_NS, started);
+        if let Err(failure) = checked {
             return BlockOutcome::Rejected(failure);
         }
         let id = match self.accept_header_hashed(&block.block.header, &block.hash, now) {
@@ -630,20 +667,71 @@ impl<S: ChainStore> ChainState<S> {
         }
     }
 
-    /// Core: `Chainstate::ConnectTip`.
-    fn connect_tip(&mut self, id: EntryId) -> Result<(), Failure> {
-        let block = self.store.get_block(self.tree.get(id)).expect("candidate has data");
-        let (changes, undo) = connect_block(&block, id, &self.tree, self.store.coins(), &self.params)?;
+    /// The second half of Core's `Chainstate::ConnectTip`: a block whose checks all passed becomes
+    /// the tip.
+    fn commit(&mut self, pending: PendingBlock) {
+        let started = std::time::Instant::now();
+        let PendingBlock { id, block, changes, undo, .. } = pending;
         let coins = self.store.coins();
         changes.apply(coins);
         coins.best_block = block.hash;
+        timing::add(&timing::APPLY_NS, started);
         let entry = self.tree.get_mut(id);
         entry.has_undo = true;
         entry.connected_once = true;
         self.tree.active.push(id);
         self.store.put_undo(self.tree.get(id), &block, undo);
         self.store.entry_changed(id, self.tree.get(id));
-        Ok(())
+    }
+
+    /// Connects `path` (children of the tip, in order). Core: `ActivateBestChainStep`, `ConnectTip`.
+    /// Up to `pipeline_depth` blocks are in progress at once: block k's scripts are verified while
+    /// block k+1's transactions are applied to a view that includes block k's (uncommitted) changes.
+    /// Blocks are committed strictly in order, and a failure is acted on only once every earlier
+    /// block has committed, so the outcome is exactly that of connecting one block at a time.
+    /// Returns false if a store hook stopped activation.
+    fn connect_path(&mut self, path: &[EntryId], failures: &mut Vec<(EntryId, Failure)>) -> bool {
+        let depth = self.pipeline_depth.max(1);
+        let mut pending: VecDeque<PendingBlock> = VecDeque::new();
+        let mut next = 0usize;
+        let mut prepare_failure: Option<(EntryId, Failure)> = None;
+        loop {
+            while prepare_failure.is_none() && next < path.len() && pending.len() < depth {
+                let id = path[next];
+                next += 1;
+                let block = self.store.get_block(self.tree.get(id)).expect("candidate has data");
+                let overlays: Vec<&BlockChanges> = pending.iter().map(|p| &p.changes).collect();
+                match prepare_block(&block, id, &self.tree, self.store.coins(), &overlays, &self.params) {
+                    Ok(prepared) => pending.push_back(PendingBlock::start(id, block, prepared)),
+                    Err(failure) => prepare_failure = Some((id, failure)),
+                }
+            }
+            let Some(oldest) = pending.pop_front() else {
+                if let Some((id, failure)) = prepare_failure.take() {
+                    self.mark_invalid(id);
+                    failures.push((id, failure));
+                }
+                return true;
+            };
+            match oldest.wait() {
+                (oldest, None) => {
+                    let id = oldest.id;
+                    self.commit(oldest);
+                    self.prune_candidates();
+                    if !self.store.connected(&self.tree, id) {
+                        self.halted = true;
+                        return false;
+                    }
+                }
+                (oldest, Some(error)) => {
+                    // Later blocks descend from this one; their work is discarded.
+                    pending.clear();
+                    self.mark_invalid(oldest.id);
+                    failures.push((oldest.id, invalid(&format!("block-script-verify-flag-failed ({})", error.message()))));
+                    return true;
+                }
+            }
+        }
     }
 
     /// Core: `Chainstate::DisconnectTip`, `DisconnectBlock`.
@@ -693,21 +781,8 @@ impl<S: ChainStore> ChainState<S> {
             let fork_height = self.tree.get(fork).height;
             let best_height = self.tree.get(best).height;
             let path: Vec<EntryId> = (fork_height + 1..=best_height).map(|h| self.tree.ancestor(best, h).unwrap()).collect();
-            for id in path {
-                match self.connect_tip(id) {
-                    Ok(()) => {
-                        self.prune_candidates();
-                        if !self.store.connected(&self.tree, id) {
-                            self.halted = true;
-                            return failures;
-                        }
-                    }
-                    Err(failure) => {
-                        self.mark_invalid(id);
-                        failures.push((id, failure));
-                        break;
-                    }
-                }
+            if !self.connect_path(&path, &mut failures) {
+                return failures;
             }
         }
     }
@@ -892,13 +967,27 @@ impl BlockChanges {
         BlockChanges { created: new_outpoint_map(), spent: new_outpoint_map() }
     }
 
-    /// The coin at `outpoint` as seen by the block so far.
-    fn get(&self, coins: &mut CoinsCache, outpoint: &OutPoint) -> Option<Coin> {
+    /// The coin at `outpoint` after this block's changes so far, if they say anything about it.
+    fn lookup(&self, outpoint: &OutPoint) -> Option<Option<Coin>> {
         if let Some((coin, _)) = self.created.get(outpoint) {
-            return coin.clone();
+            return Some(coin.clone());
         }
         if self.spent.contains_key(outpoint) {
-            return None;
+            return Some(None);
+        }
+        None
+    }
+
+    /// The coin at `outpoint` as seen by the block so far: its own changes, then those of the
+    /// earlier uncommitted blocks (newest first), then the cache.
+    fn get(&self, coins: &mut CoinsCache, earlier: &[&BlockChanges], outpoint: &OutPoint) -> Option<Coin> {
+        if let Some(found) = self.lookup(outpoint) {
+            return found;
+        }
+        for overlay in earlier.iter().rev() {
+            if let Some(found) = overlay.lookup(outpoint) {
+                return found;
+            }
         }
         coins.get(outpoint)
     }
@@ -939,14 +1028,66 @@ struct TxScriptData {
     precomputed: PrecomputedTx,
 }
 
+/// A block prepared for connection: its UTXO changes, undo data, and what its script checks need.
+pub struct PreparedBlock {
+    changes: BlockChanges,
+    undo: BlockUndo,
+    script_data: Vec<Option<TxScriptData>>,
+    flags: u32,
+}
+
+/// A block whose scripts are being verified in the background.
+struct PendingBlock {
+    id: EntryId,
+    block: Arc<BlockData>,
+    changes: BlockChanges,
+    undo: BlockUndo,
+    scripts: std::sync::mpsc::Receiver<Option<ScriptError>>,
+}
+
+impl PendingBlock {
+    fn start(id: EntryId, block: Arc<BlockData>, prepared: PreparedBlock) -> PendingBlock {
+        let PreparedBlock { changes, undo, script_data, flags } = prepared;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let job_block = block.clone();
+        rayon::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = verify_block_scripts(&job_block.block.transactions, &script_data, flags);
+            timing::add(&timing::SCRIPTS_NS, started);
+            let _ = sender.send(result);
+        });
+        PendingBlock { id, block, changes, undo, scripts: receiver }
+    }
+
+    /// Waits for the script checks; returns the first failing input's error, if any.
+    fn wait(self) -> (PendingBlock, Option<ScriptError>) {
+        let started = std::time::Instant::now();
+        let result = self.scripts.recv().expect("script verification task");
+        timing::add(&timing::WAIT_NS, started);
+        (self, result)
+    }
+}
+
 /// Connects `block` (entry `id`, whose parent is the active tip) to the UTXO set in `coins`.
 /// On success returns the changes to apply and the undo data. Core: `ConnectBlock`.
 pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &mut CoinsCache, params: &NetworkParams) -> Result<(BlockChanges, BlockUndo), Failure> {
+    let prepared = prepare_block(block, id, tree, coins, &[], params)?;
+    if let Some(error) = verify_block_scripts(&block.block.transactions, &prepared.script_data, prepared.flags) {
+        return Err(invalid(&format!("block-script-verify-flag-failed ({})", error.message())));
+    }
+    Ok((prepared.changes, prepared.undo))
+}
+
+/// Everything `ConnectBlock` checks except the scripts (chapter 10 section 10.8 steps 1 to 4),
+/// against the UTXO set in `coins` as modified by `earlier` (uncommitted blocks between the active
+/// tip and this block's parent, oldest first).
+pub fn prepare_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &mut CoinsCache, earlier: &[&BlockChanges], params: &NetworkParams) -> Result<PreparedBlock, Failure> {
     let consensus = &params.consensus;
     let entry = tree.get(id);
     let mut changes = BlockChanges::new();
+    let flags = block_script_flags(&entry.hash, entry.height, consensus);
     if entry.hash == consensus.genesis_hash {
-        return Ok((changes, Vec::new()));
+        return Ok(PreparedBlock { changes, undo: Vec::new(), script_data: Vec::new(), flags });
     }
     let height = entry.height;
     let parent_id = entry.parent.expect("non-genesis block has a parent");
@@ -963,6 +1104,7 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
     let check_bip30 = enforce_bip30 || height >= BIP34_IMPLIES_BIP30_LIMIT;
 
     // Load every coin the block can touch in one batched lookup (a cache warm-up only).
+    let started = std::time::Instant::now();
     {
         let mut wanted: Vec<OutPoint> = Vec::new();
         for tx in transactions.iter().skip(1) {
@@ -974,12 +1116,15 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
             }
         }
         coins.prefetch(&wanted);
+        timing::INPUTS.fetch_add(wanted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
+    timing::add(&timing::PREFETCH_NS, started);
+    let started = std::time::Instant::now();
 
     if check_bip30 {
         for (tx, info) in transactions.iter().zip(&block.tx_info) {
             for vout in 0..tx.outputs.len() as u32 {
-                if coins.get(&OutPoint { txid: info.txid, vout }).is_some() {
+                if changes.get(coins, earlier, &OutPoint { txid: info.txid, vout }).is_some() {
                     return Err(invalid("bad-txns-BIP30"));
                 }
             }
@@ -987,7 +1132,6 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
     }
 
     let enforce_bip68 = height >= consensus.csv_height;
-    let flags = block_script_flags(&entry.hash, height, consensus);
     let mtp_at = |h: i32| tree.get(tree.ancestor(id, h).expect("ancestor exists")).median_time_past;
 
     let mut fees: i64 = 0;
@@ -1000,7 +1144,7 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
         let spent: Vec<Coin> = if is_coinbase {
             Vec::new()
         } else {
-            let found: Vec<Option<Coin>> = tx.inputs.iter().map(|input| changes.get(coins, &input.prevout)).collect();
+            let found: Vec<Option<Coin>> = tx.inputs.iter().map(|input| changes.get(coins, earlier, &input.prevout)).collect();
             let fee = check_tx_inputs(tx, &found, height).map_err(invalid)?;
             fees += fee;
             if !money_range(fees) {
@@ -1039,7 +1183,7 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
             let outpoint = OutPoint { txid, vout: vout as u32 };
             // Only a coinbase can repeat an earlier txid while that one is unspent (BIP30
             // exceptions); for anything else BIP30 (or BIP34) rules the overwrite out.
-            let overwrote = if is_coinbase { changes.get(coins, &outpoint).is_some() } else { false };
+            let overwrote = if is_coinbase { changes.get(coins, earlier, &outpoint).is_some() } else { false };
             let coin = Coin { output: output.clone(), height, is_coinbase };
             match changes.created.get_mut(&outpoint) {
                 Some(existing) => {
@@ -1057,11 +1201,8 @@ pub fn connect_block(block: &BlockData, id: EntryId, tree: &BlockTree, coins: &m
     if transactions[0].value_out() > block_reward {
         return Err(invalid("bad-cb-amount"));
     }
-
-    if let Some(error) = verify_block_scripts(transactions, &script_data, flags) {
-        return Err(invalid(&format!("block-script-verify-flag-failed ({})", error.message())));
-    }
-    Ok((changes, undo))
+    timing::add(&timing::SERIAL_NS, started);
+    Ok(PreparedBlock { changes, undo, script_data, flags })
 }
 
 /// Runs every input's script check in parallel and returns the error of the first failing input

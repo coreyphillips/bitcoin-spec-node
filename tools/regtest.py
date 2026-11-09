@@ -322,6 +322,34 @@ def scenario_restart(args):
         core.stop()
 
 
+def scenario_bench(args):
+    """Builds (once) a large chain on Core and measures how fast the node synchronizes it."""
+    core = Core("core-bench", 30731, 30732)
+    node = Node("node-bench")
+    try:
+        built = os.path.exists(os.path.join(core.datadir, "regtest", "blocks")) and args.get("rebuild", 0) == 0
+        core.start(fresh=not built)
+        if not built:
+            make_chain(core, blocks=args.get("blocks", 600), txs=args.get("txs", 2500), seed=11)
+        tip, height = core.tip()
+        log(f"core has {height} blocks; benchmarking a sync to {tip}")
+        node.reset()
+        extra = []
+        if "dbcache" in args:
+            extra += ["--dbcache", str(args["dbcache"])]
+        started = time.time()
+        node.start(30731, stop_at=tip, extra=extra)
+        event = node.wait_for(lambda e: e.get("event") == "stopped", 3600)
+        elapsed = time.time() - started
+        node.wait_exit()
+        stats = core.rpc("getchaintxstats")
+        log(f"synced {height} blocks ({stats['txcount']} transactions) in {elapsed:.1f}s: {height / elapsed:.1f} blocks/s, {stats['txcount'] / elapsed:.0f} tx/s")
+        return compare(core, event, "bench")
+    finally:
+        node.kill()
+        core.stop()
+
+
 def main():
     scenario = sys.argv[1] if len(sys.argv) > 1 else "all"
     args = {}
@@ -336,6 +364,8 @@ def main():
         results["reorg"] = scenario_follow_and_reorg(args)
     if scenario in ("restart", "all"):
         results["restart"] = scenario_restart(args)
+    if scenario == "bench":
+        results["bench"] = scenario_bench(args)
     log(f"results: {results}")
     return 0 if all(results.values()) else 1
 
