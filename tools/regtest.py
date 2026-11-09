@@ -225,6 +225,31 @@ def compare(core, event, label):
     return ok
 
 
+def check_contract(node, exit_code, stop_hash):
+    """PROTOCOL.md section 5 output rules for a run that reached `stop_hash`: one `stopped` line,
+    last, exit status 0; tip lines name each connected block at most once (no reorganization
+    here); `utxo_hash` lines come before `stopped`; nothing else."""
+    with node.lock:
+        events = list(node.events)
+    problems = []
+    stopped = [e for e in events if e.get("event") == "stopped"]
+    if len(stopped) != 1 or events[-1].get("event") != "stopped" or stopped[0]["tip"] != stop_hash:
+        problems.append(f"{len(stopped)} stopped lines; last line {events[-1] if events else None}")
+    tips = [e["tip"] for e in events if e.get("event") == "tip"]
+    if len(tips) != len(set(tips)):
+        problems.append(f"{len(tips) - len(set(tips))} repeated tip lines")
+    others = [e for e in events if e.get("event") not in ("tip", "stopped", "utxo_hash")]
+    if others:
+        problems.append(f"unexpected lines: {others[:3]}")
+    hashes = {e["height"]: e["hash_serialized_3"] for e in events if e.get("event") == "utxo_hash"}
+    if stopped and stopped[0]["height"] in hashes and hashes[stopped[0]["height"]] != stopped[0]["hash_serialized_3"]:
+        problems.append("utxo_hash at the stop height differs from the stopped line")
+    if exit_code != 0:
+        problems.append(f"exit status {exit_code}")
+    log(f"output contract: {len(events)} lines, {len(hashes)} utxo_hash lines -> {'; '.join(problems) if problems else 'OK'}")
+    return not problems
+
+
 def scenario_sync(args):
     core = Core("core-sync", 30701, 30702)
     node = Node("node-sync")
@@ -235,11 +260,14 @@ def scenario_sync(args):
         log(f"core has {height} blocks; syncing the node to {tip}")
         node.reset()
         started = time.time()
-        node.start(30701, stop_at=tip)
+        # Fingerprints at a middle height and at the stop block itself (both reported, the
+        # stop block's before the stopped line).
+        node.start(30701, stop_at=tip, extra=["--utxo-hash-at", f"{height // 2},{height}"])
         event = node.wait_for(lambda e: e.get("event") == "stopped", 600)
         log(f"synced {height} blocks in {time.time() - started:.1f}s")
-        node.wait_exit()
-        return compare(core, event, "sync")
+        code = node.wait_exit()
+        contract = check_contract(node, code, tip)
+        return compare(core, event, "sync") and contract
     finally:
         node.kill()
         core.stop()

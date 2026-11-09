@@ -556,6 +556,26 @@ RESULT: PASS
   had just invalidated (same coinbase script, same transactions), so each step now mines to a
   coinbase script of its own.
 - Damaged block files after a kill (`tools/corrupt_test.py`): see bug 3 below; match after the fix.
+- Short block syncs from DNS-seed peers (not full syncs; stopped with SIGINT, clean exit 0):
+  signet, all 330,021 headers and every block to height 140,666 in 182 s (each block's signet
+  solution checked; up to 1,537 blocks/s); testnet3, all 5,303,812 headers and blocks to height
+  36,045 in 171 s. No block was rejected on either network.
+
+### Holdout: testnet4 full sync (run by the experiment owner, 2026-11-08)
+
+The experiment owner ran the build of commit `7ddd347` from an isolated clone, from public
+DNS-seed peers (no `--connect`), with `--utxo-hash-at 90000,120000,150000` and `--stop-at` the
+block at 150,000, and compared the fingerprints with Bitcoin Core v32.1's assumeutxo values. Result
+as reported by the owner: PASSED, all three identical; genesis to 150,000 in 68 minutes (19:33 to
+20:41), no restart. The node's lines (from the owner's `testnet4.events.jsonl`, read-only):
+
+| Height | `hash_serialized_3` | txouts |
+|---|---|---|
+| 90,000 | `784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5` | 12,742,177 |
+| 120,000 | `10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0` | 13,870,119 |
+| 150,000 | `ca068cae50679d7c947454bbe4f0e6aeec1fbe2c6c2735a08bb988623649f950` | 14,228,512 |
+
+The owner also reported the `stopped` line as printed twice; see bug 4 below.
 
 ### M4: performance and memory (2026-11-08)
 
@@ -576,6 +596,7 @@ conformance suites and the kill/restart scenario passing after each change. Numb
 | Public mainnet, DNS-seed peers (short test only) | first try: heights 0 to 31,810 in about 6 minutes; header download from public peers that were also serving our block requests was the limit (576,000 headers after 5.5 minutes) |
 | same, after making the node request blocks from a peer only once that peer's headers are synchronized (headers first) | all 975,116 headers, then heights 0 to 76,937, in 170 s; about 1,050 blocks/s on the early chain (under load) |
 | Coin prefetch (`bench-flush`, 10 million coins read back from RocksDB on a 16-thread read pool): one `get` per coin against batched `MultiGet` in chunks of 256 sorted keys, alternating runs | single gets 8.3, 4.7, 9.5, 8.2 s; `MultiGet` 5.8, 5.9, 4.4, 3.4 s (kept) |
+| Public testnet4 full sync to 150,000 from DNS-seed peers (holdout run by the experiment owner, build `7ddd347`, three fingerprints identical to Core's) | 68 minutes |
 | Peak memory, regtest benchmark (`--dbcache 1000`) | 1.9 GB resident |
 
 What the profile (`sample`) showed and what changed because of it:
@@ -643,3 +664,16 @@ consensus code, found by my own tests.)
    its stored descendants (unlinked, removed from candidates), so they are downloaded again and
    linked anew when they arrive; the wanted list is also refreshed every 5 s. Not a specification
    problem: the reference never loses data it stored.
+4. **The tip line of the stop block was printed twice when that block was also a `--utxo-hash-at`
+   height** (found by the experiment owner in the testnet4 holdout output, reported as the
+   `stopped` line printed twice). The owner's events file has one `stopped` line (its line 2,776,
+   the last) and, just before the `utxo_hash` line, two identical `tip` lines for block 150,000
+   (lines 2,773 and 2,774). Root cause: the store's `connected` hook printed a progress line for the
+   stop block and a second one for a fingerprint height. PROTOCOL.md section 5 allows progress
+   lines at any time, so this did not break the contract, but it is noise; the node now prints at
+   most one line per connected block. `tools/regtest.py sync` now checks the output contract
+   (exactly one `stopped` line, last, exit status 0, no repeated tip lines, no other events, the
+   `utxo_hash` at the stop height equal to the `stopped` hash) with fingerprints at a middle height
+   and at the stop block: it reported "2 repeated tip lines" on the build before the fix and OK
+   after. The `stopped` line itself is printed only by `finish()`, which consumes the node, so it
+   cannot appear twice in one process. Not a specification problem.

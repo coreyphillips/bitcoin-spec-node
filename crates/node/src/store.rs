@@ -672,12 +672,14 @@ impl ChainStore for DiskStore {
         self.connected_count += 1;
         let now = std::time::Instant::now();
         let is_stop = self.hooks.stop_at == Some(entry.hash);
-        if is_stop || now.duration_since(self.last_progress) >= self.hooks.progress_interval {
+        let hash_here = self.hooks.utxo_hash_heights.contains(&entry.height);
+        // One progress line per connected block at most (the stop block and the fingerprint
+        // heights are always reported, other blocks at most once per progress interval).
+        if is_stop || hash_here || now.duration_since(self.last_progress) >= self.hooks.progress_interval {
             self.last_progress = now;
             crate::emit(&format!("{{\"event\":\"tip\",\"tip\":\"{}\",\"height\":{}}}", hash_to_display(&entry.hash), entry.height));
         }
-        if self.hooks.utxo_hash_heights.contains(&entry.height) {
-            crate::emit(&format!("{{\"event\":\"tip\",\"tip\":\"{}\",\"height\":{}}}", hash_to_display(&entry.hash), entry.height));
+        if hash_here {
             if let Err(error) = self.flush() {
                 eprintln!("fatal: flush failed: {error}");
                 std::process::exit(1);
