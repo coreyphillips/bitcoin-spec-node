@@ -738,6 +738,11 @@ mod tests {
         assert_eq!(outpoint_from_key(&outpoint_key(&a)), Some(a));
     }
 
+    /// Steps of the cache model test (`BSN_CACHE_TEST_STEPS`, default 200,000).
+    fn cache_test_steps() -> usize {
+        std::env::var("BSN_CACHE_TEST_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000)
+    }
+
     /// The cache over a backend behaves exactly like a plain map of coins, whatever the order of
     /// puts, deletes, lookups, prefetches and flushes.
     #[test]
@@ -751,7 +756,7 @@ mod tests {
         };
         let mut cache = CoinsCache::new(Box::<MemoryCoinDb>::default(), [0; 32], 64);
         let mut model: BTreeMap<OutPoint, Coin> = BTreeMap::new();
-        for step in 0..200_000 {
+        for step in 0..cache_test_steps() {
             let outpoint = OutPoint { txid: [(next() % 40) as u8; 32], vout: (next() % 3) as u32 };
             match next() % 10 {
                 0..=3 => {
