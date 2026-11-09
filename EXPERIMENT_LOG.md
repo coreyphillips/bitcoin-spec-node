@@ -604,6 +604,7 @@ conformance suites and the kill/restart scenario passing after each change. Numb
 | same, after making the node request blocks from a peer only once that peer's headers are synchronized (headers first) | all 975,116 headers, then heights 0 to 76,937, in 170 s; about 1,050 blocks/s on the early chain (under load) |
 | Coin prefetch (`bench-flush`, 10 million coins read back from RocksDB on a 16-thread read pool): one `get` per coin against batched `MultiGet` in chunks of 256 sorted keys, alternating runs | single gets 8.3, 4.7, 9.5, 8.2 s; `MultiGet` 5.8, 5.9, 4.4, 3.4 s (kept) |
 | Public testnet4 full sync to 150,000 from DNS-seed peers (holdout run by the experiment owner, build `7ddd347`, three fingerprints identical to Core's) | 68 minutes |
+| Mainnet full sync to 975,132 from the local Core node (holdout run by the experiment owner, build `1124fb7`, five fingerprints and the tip identical to Core's) | 2 hours 26 minutes; 90 to 100 blocks/s on the last blocks |
 | Peak memory, regtest benchmark (`--dbcache 1000`) | 1.9 GB resident |
 
 What the profile (`sample`) showed and what changed because of it:
@@ -745,6 +746,37 @@ Summary of the experiment:
 | interop with bitcoind | 18/18 chains match (M3) | 20/20 chains match |
 | headers-live | mainnet 975,114 and testnet4 159,961 headers | also testnet3, 5,303,811 headers |
 | testnet4 holdout (experiment owner) | | 3/3 fingerprints identical to Core's, build `7ddd347` |
+| mainnet holdout (experiment owner) | | 5/5 fingerprints and the tip identical to Core's, build `1124fb7` |
+
+### Holdout: mainnet full sync (run by the experiment owner, 2026-11-08)
+
+The experiment owner ran the build of commit `1124fb7` from an isolated clone, with the local
+Bitcoin Core v32.1 node as the only peer (`--connect 127.0.0.1:8333`, default `--dbcache 12000`)
+and `--utxo-hash-at 840000,880000,910000,935000,965000`, without `--stop-at`. It started at 21:30
+and reached the tip, 975,132, about 2 hours 26 minutes later, with no error event. All five
+fingerprints are identical to Bitcoin Core v32.1's assumeutxo values:
+
+| Height | `hash_serialized_3` | txouts | Computed in |
+|---|---|---|---|
+| 840,000 | `a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96` | 176,948,713 | 50.9 s |
+| 880,000 | `dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9` | 184,821,030 | 53.3 s |
+| 910,000 | `4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568` | 167,821,142 | 55.9 s |
+| 935,000 | `e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050` | 164,241,311 | 44.0 s |
+| 965,000 | `4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2` | 165,734,792 | 46.0 s |
+
+Then the comparison at a common tip:
+
+1. SIGTERM at 975,132: the node flushed and exited cleanly in 4 s.
+2. Bitcoin Core's `gettxoutsetinfo` (64 s) reported block
+   `00000000000000000000d50927e773416b727bdb5706f62a8ec4a7006011a1a1` at 975,132, with
+   `hash_serialized_3` `0139bed824c0ad6b70c60c63fa2bf09fdd06e02a957b4362d6a9889befe1c0ef` over
+   163,585,794 txouts.
+3. The node was restarted with `--stop-at` that block. It loaded its tip from disk and printed a
+   `stopped` line with the same block and the same hash (31 s).
+
+The last blocks ran at 90 to 100 blocks per second, within the M4 estimate. Once, block 641,947
+took 30 to 40 s to arrive. Bitcoin Core was the only peer, so there was no other peer to ask; the
+download then continued by itself.
 
 ## Bugs found
 

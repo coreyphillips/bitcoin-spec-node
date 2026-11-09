@@ -22,6 +22,9 @@ the specification was unclear, incomplete or wrong.
   SIGKILLs during a sync and damaged block files.
 - A full testnet4 sync from public peers to 150,000 (run by the experiment owner) reproduced
   Bitcoin Core's three published UTXO set fingerprints.
+- A full mainnet sync from a local Bitcoin Core v32.1 node (run by the experiment owner), every
+  script checked, reproduced Bitcoin Core's five published mainnet fingerprints (840,000 to
+  965,000) and Bitcoin Core's `gettxoutsetinfo` at the tip, 975,132, in 2 hours 26 minutes.
 
 ## Layout
 
