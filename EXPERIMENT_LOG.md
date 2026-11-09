@@ -405,3 +405,87 @@ RESULT: PASS
 
 All 18 chains match (tip, height, `hash_serialized_3`) and bitcoind logged no `Misbehaving` line;
 `mining_basic.node0` is excluded by the runner's stated rule (blocks dated in the future).
+
+#### Corpus with 20 files (2026-11-08)
+
+`feature_spec_pitfalls.node1` (bip34@2, dersig@300, cltv@300: negative and version-1 blocks
+rejected with `bad-version` at height 11, version 0x80000000 valid at height 1) and
+`feature_spec_pitfalls.node2` (`-test=bip94`: blocks 601 s and 1,200 s before their parent rejected
+with `time-timewarp-attack` at a period start, exactly 600 s accepted) were added, and node0 was
+re-recorded. Corpus suite, first run on them (build with batched activation and pipelined script
+checks, see M4), verbatim:
+
+```text
+harness: bitcoin-spec-node 0.1.0 (spec v32.1-1), ops: info, script_verify, tx_check, sighash_legacy, sighash_taproot, taproot_commitment_verify, schnorr_verify, chain_reset, chain_process_block, chain_process_headers, chain_invalidate, chain_tip, chain_tips, utxo_hash
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+corpus         -             5275      5275        0        0        2288        0    11.4s
+
+corpus file                                   checks  L0 normat.    L0 other   L1 tips   L2 utxo errors     time
+feature_bip68_sequence.node0                      31       31/31         0/0     31/31     29/29      0     0.0s
+feature_bip68_sequence.node1                      13       13/13         0/0     13/13     13/13      0     0.0s
+feature_block.node0                              128     128/128         0/0   104/104     40/40      0     0.2s
+feature_block_reorg.node0                        133     133/133         0/0   104/104     43/43      0     8.0s
+feature_cltv.node0                                11       11/11         0/0     11/11       5/5      0     0.0s
+feature_csv_activation.node0                     139     139/139         0/0     82/82     33/33      0     0.1s
+feature_dersig.node0                               6         6/6         0/0       6/6       4/4      0     0.0s
+feature_nulldummy.node0                            8         8/8         0/0       8/8       6/6      0     0.0s
+feature_segwit.node0                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node1                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node2                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_spec_pitfalls.node0                       37       37/37         0/0     37/37     18/18      0     0.0s
+feature_spec_pitfalls.node1                        7         7/7         0/0       7/7       4/4      0     0.0s
+feature_spec_pitfalls.node2                      147     147/147         0/0   147/147   145/145      0     0.0s
+feature_taproot.node0                           4044   4044/4044         0/0   108/108 1467/1467      0     2.1s
+mining_basic.node0                               375     375/375         0/0   375/375   328/328      0     0.5s
+mining_basic.node1                                 4         3/3         1/1       4/4       4/4      0     0.0s
+p2p_invalid_block.node0                           10       10/10         0/0     10/10       5/5      0     0.0s
+p2p_segwit.node0                                 106     106/106         0/0   106/106     67/67      0     0.2s
+p2p_segwit.node1                                  41       41/41         0/0     41/41     41/41      0     0.1s
+total (20 files, 17150 events)                  5276   5275/5275         1/1 1230/1230 2288/2288
+restarts: 33 (0 skipped by the shortcut, 10781 events re-delivered); harness outcomes (diagnostic): block:accepted 8173, block:duplicate 2, block:invalid 2887, block:mutated 25, block:temporary 3, headers:accepted 703, headers:invalid 8, invalidate:ok 20
+
+RESULT: PASS
+```
+
+### Live header chains (2026-11-08)
+
+`bcs-conformance headers-live` against public peers (the runner downloads the header chain itself
+and feeds it to the harness): testnet4 from `seed.testnet4.bitcoin.sprovoost.nl`, 159,961 headers
+in 80 messages, all accepted (minimum-difficulty blocks, BIP94); mainnet from
+`seed.bitcoin.sprovoost.nl`, verbatim:
+
+```text
+harness: bitcoin-spec-node 0.1.0 (spec v32.1-1), ops: info, script_verify, tx_check, sighash_legacy, sighash_taproot, taproot_commitment_verify, schnorr_verify, chain_reset, chain_process_block, chain_process_headers, chain_invalidate, chain_tip, chain_tips, utxo_hash
+headers-live: connected to 162.245.185.13:8333 (/Satoshi:29.0.0/, protocol 70016, start height 975114)
+headers-live: 162.245.185.13:8333: Connection reset by peer (os error 54); reconnecting
+headers-live: connected to 103.228.171.171:8333 (/Satoshi:27.0.0/, protocol 70016, start height 975114)
+headers-live: height 100000 after 50 messages, 13 s
+headers-live: height 200000 after 100 messages, 26 s
+headers-live: height 300000 after 150 messages, 39 s
+headers-live: height 400000 after 200 messages, 47 s
+headers-live: height 500000 after 250 messages, 56 s
+headers-live: height 600000 after 300 messages, 63 s
+headers-live: height 700000 after 350 messages, 69 s
+headers-live: height 800000 after 400 messages, 77 s
+headers-live: height 900000 after 450 messages, 90 s
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+headers-live   -              490       490        0        0           0        0    95.2s
+
+headers-live: network main, peer 103.228.171.171:8333 (/Satoshi:27.0.0/, protocol 70016, start height 975114)
+headers-live: 975114 headers in 488 messages, last header 00000000000000000000d64b1a1927a736eecf5524496bfc60eadd2d1ba2464e at height 975114, chainwork 000000000000000000000000000000000000000156dae733b668a04d89e38b8b, 95 s
+
+RESULT: PASS
+```
+
+### Public network (2026-11-08)
+
+Peer discovery from the chapter 14.6 DNS seeds when no `--connect` is given (8 peers; peers that do
+not advertise `NODE_NETWORK` and `NODE_WITNESS` are dropped), block requests only to peers known to
+have the block, Core-style stall handling (a peer holding up the next block for 2 s, doubling to
+64 s, is replaced). A short testnet4 run from public peers (not a full sync; the full testnet4 and
+mainnet syncs are the experiment owner's holdout runs): headers to 159,961 in seconds, blocks
+validated to height 35,703 in 100 s with 8 peers, no block rejected; then a restart (resumed from
+the flushed state at 35,829), a SIGKILL at 47,219 and another restart, which resumed from 35,829
+again (the last flush), as designed.

@@ -4,6 +4,7 @@
 //! - `harness`: the conformance protocol on standard input and output (conformance/PROTOCOL.md);
 //! - `run`: a persistent full node that synchronizes from the peers given with `--connect`.
 
+mod downloads;
 mod harness;
 mod net;
 mod node;
@@ -29,7 +30,7 @@ pub fn emit(line: &str) {
 fn usage() -> ! {
     eprintln!("usage: bitcoin-spec-node harness");
     eprintln!(
-        "       bitcoin-spec-node run --network <main|testnet3|testnet4|signet|regtest> --datadir <dir> --connect <host:port> [--connect ...]\n\
+        "       bitcoin-spec-node run --network <main|testnet3|testnet4|signet|regtest> --datadir <dir> [--connect <host:port> ...] [--max-peers <n>]\n\
          \x20                          [--stop-at <hash>] [--utxo-hash-at <h1,h2,...>] [--options <json>] [--dbcache <MiB>]\n\
          \x20                          [--max-in-flight <n>] [--prune-depth <n>] [--idle-timeout <seconds>]"
     );
@@ -60,6 +61,7 @@ fn parse_run(args: &[String]) -> node::NodeConfig {
     let mut prune_depth = 2100;
     let mut options = consensus::params::NetworkOptions::default();
     let mut idle_timeout = 300u64;
+    let mut max_peers = 8usize;
     let mut i = 0;
     let value = |i: usize| -> String { args.get(i + 1).cloned().unwrap_or_else(|| usage()) };
     while i < args.len() {
@@ -83,14 +85,16 @@ fn parse_run(args: &[String]) -> node::NodeConfig {
                 })
             }
             "--idle-timeout" => idle_timeout = value(i).parse::<u64>().unwrap_or_else(|_| usage()),
+            "--max-peers" => max_peers = value(i).parse::<usize>().unwrap_or_else(|_| usage()).max(1),
             _ => usage(),
         }
         i += 2;
     }
     let network = network.unwrap_or_else(|| usage());
     let datadir = datadir.unwrap_or_else(|| usage());
-    if connect.is_empty() {
-        usage();
+    if connect.is_empty() && network == Network::Regtest {
+        eprintln!("regtest has no DNS seeds: give the peer with --connect");
+        std::process::exit(2);
     }
     let default_cache = if network == Network::Main { 12_000 } else { 1_000 };
     node::NodeConfig {
@@ -104,6 +108,7 @@ fn parse_run(args: &[String]) -> node::NodeConfig {
         prune_depth,
         options,
         idle_timeout: std::time::Duration::from_secs(idle_timeout),
+        max_peers,
     }
 }
 

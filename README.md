@@ -21,7 +21,16 @@ the specification was unclear, incomplete or wrong.
 | `tools/txgen` | `bsn-txgen`, builds regtest blocks full of signed transactions and submits them to Bitcoin Core |
 | `tools/regtest.py` | Regtest interoperability scenarios against Bitcoin Core (sync, follow, reorganize, kill and restart) |
 | `tools/check_custom.py` | Checks a harness against `spec-package/conformance/vectors/custom/*.jsonl` |
-| `spec-package/` | The specification package (provided separately, read-only, not part of this repository) |
+| `spec-package/` | The specification package (read-only, not part of this repository's history; see below) |
+
+`spec-package/` is a copy of [github.com/coreyphillips/bitcoin-consensus-spec](https://github.com/coreyphillips/bitcoin-consensus-spec):
+its `spec/` and `conformance/` directories (the chapters, the protocol and corpus documents, the
+runner, the vectors and the block corpus) plus the top-level `Cargo.toml`, `Cargo.lock`,
+`README.md` and `LICENSE`, without `reference/` (the specification's own implementation, which the
+experiment did not use) and without the corpus recorder (`conformance/recorder/`; the
+`conformance/oracle-core/` harness is not included either). To rebuild it, clone that repository at
+the tag the experiment used, copy those files and directories into `spec-package/`, remove the
+excluded ones, and build the runner with `cargo build --release` inside `spec-package/`.
 
 ## Building
 

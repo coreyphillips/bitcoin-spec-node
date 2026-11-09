@@ -517,6 +517,32 @@ impl<S: ChainStore> ChainState<S> {
     /// Core: `ChainstateManager::ProcessNewBlock`. `requested` is false only for blocks a peer sent
     /// without being asked; block submission by an operator counts as requested.
     pub fn process_block(&mut self, block: Arc<BlockData>, now: i64, requested: bool) -> BlockOutcome {
+        let id = block.hash;
+        match self.store_block(block, now, requested) {
+            BlockOutcome::Accepted => {
+                let id = self.tree.lookup(&id).expect("stored");
+                // A failure of this very block is reported; a failure of an ancestor leaves `Accepted`.
+                match self.activate_best_chain().into_iter().find(|(failed, _)| *failed == id) {
+                    Some((_, failure)) => BlockOutcome::Rejected(failure),
+                    None => BlockOutcome::Accepted,
+                }
+            }
+            BlockOutcome::Duplicate => {
+                self.activate_best_chain();
+                BlockOutcome::Duplicate
+            }
+            BlockOutcome::AcceptedHeaderOnly => {
+                self.activate_best_chain();
+                BlockOutcome::AcceptedHeaderOnly
+            }
+            other => other,
+        }
+    }
+
+    /// Steps 1 to 6 of `process_block` (everything except chain activation). A node that receives
+    /// several blocks at once may store them all and activate once: the chain then selected is the
+    /// same, and connecting several blocks in one activation lets their script checks overlap.
+    pub fn store_block(&mut self, block: Arc<BlockData>, now: i64, requested: bool) -> BlockOutcome {
         let started = std::time::Instant::now();
         let checked = check_block(&block, &self.params.consensus);
         timing::add(&timing::CHECKS_NS, started);
@@ -529,14 +555,12 @@ impl<S: ChainStore> ChainState<S> {
             Err(HeaderError::Failed(failure)) => return BlockOutcome::Rejected(failure),
         };
         if self.tree.get(id).has_data {
-            self.activate_best_chain();
             return BlockOutcome::Duplicate;
         }
         if !requested {
             let entry = self.tree.get(id);
             let tip = self.tip();
             if entry.chain_work < tip.chain_work || entry.height > tip.height + MIN_BLOCKS_TO_KEEP || entry.chain_work < self.minimum_chain_work {
-                self.activate_best_chain();
                 return BlockOutcome::AcceptedHeaderOnly;
             }
         }
@@ -561,11 +585,7 @@ impl<S: ChainStore> ChainState<S> {
         self.store.put_block(self.tree.get(id), block);
         self.store.entry_changed(id, self.tree.get(id));
         self.link(id);
-        // A failure of this very block is reported; a failure of an ancestor leaves `Accepted`.
-        match self.activate_best_chain().into_iter().find(|(failed, _)| *failed == id) {
-            Some((_, failure)) => BlockOutcome::Rejected(failure),
-            None => BlockOutcome::Accepted,
-        }
+        BlockOutcome::Accepted
     }
 
     /// Assigns sequence numbers to `id` and any waiting descendants, or queues it until its parent

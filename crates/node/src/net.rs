@@ -2,6 +2,8 @@
 //! one writer thread per peer. Readers answer `ping` themselves (so a busy validation loop never
 //! delays a `pong`) and forward every other message to the node's event channel.
 
+use crate::downloads::Downloads;
+use consensus::hashes::sha256d;
 use consensus::p2p::{checksum_ok, decode_message_header, encode_message};
 use crossbeam_channel::{Receiver, Sender};
 use std::io::{BufReader, Read, Write};
@@ -10,16 +12,17 @@ use std::time::Duration;
 
 pub enum NetEvent {
     Connected { peer: usize, sender: Sender<Vec<u8>> },
-    Message { peer: usize, command: String, payload: Vec<u8> },
+    /// `requested` is meaningful for `block` messages only: the node had asked for the block.
+    Message { peer: usize, command: String, payload: Vec<u8>, requested: bool },
     Disconnected { peer: usize, reason: String },
 }
 
 /// Connects to `address` in a background thread. Events are sent to `events`.
-pub fn connect(peer: usize, address: String, magic: [u8; 4], events: Sender<NetEvent>) {
+pub fn connect(peer: usize, address: String, magic: [u8; 4], events: Sender<NetEvent>, downloads: Downloads) {
     std::thread::Builder::new()
         .name(format!("peer-{peer}"))
         .spawn(move || {
-            let reason = match run_peer(peer, &address, magic, &events) {
+            let reason = match run_peer(peer, &address, magic, &events, &downloads) {
                 Ok(()) => "closed".to_string(),
                 Err(error) => error.to_string(),
             };
@@ -28,7 +31,7 @@ pub fn connect(peer: usize, address: String, magic: [u8; 4], events: Sender<NetE
         .expect("spawn peer thread");
 }
 
-fn run_peer(peer: usize, address: &str, magic: [u8; 4], events: &Sender<NetEvent>) -> std::io::Result<()> {
+fn run_peer(peer: usize, address: &str, magic: [u8; 4], events: &Sender<NetEvent>, downloads: &Downloads) -> std::io::Result<()> {
     let socket = address
         .to_socket_addrs()?
         .next()
@@ -68,7 +71,9 @@ fn run_peer(peer: usize, address: &str, magic: [u8; 4], events: &Sender<NetEvent
             let _ = sender.send(encode_message(magic, "pong", &payload));
             continue;
         }
-        if events.send(NetEvent::Message { peer, command: parsed.command, payload }).is_err() {
+        // A block frees a download slot: refill it right away, whatever the chain thread is doing.
+        let requested = parsed.command == "block" && payload.len() >= 80 && downloads.lock().unwrap().received(&sha256d(&payload[..80]));
+        if events.send(NetEvent::Message { peer, command: parsed.command, payload, requested }).is_err() {
             return Ok(());
         }
     }

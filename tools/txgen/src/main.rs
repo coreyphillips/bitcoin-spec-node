@@ -375,6 +375,14 @@ impl Generator {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("--bench-sigs") {
+        bench_signatures();
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("--bench-download") {
+        bench_download(&args[1], args[2].parse().expect("in flight"));
+        return;
+    }
     let mut rpc_address = String::from("127.0.0.1:30702");
     let mut user = String::from("u");
     let mut password = String::from("p");
@@ -434,4 +442,105 @@ fn main() {
         }
     }
     println!("{} {}", hash_to_display(&generator.tip), generator.height);
+}
+
+/// `bsn-txgen --bench-sigs`: raw libsecp256k1 verification throughput, one thread and all threads.
+#[allow(dead_code)]
+pub fn bench_signatures() {
+    use rayon::prelude::*;
+    let keys: Vec<Key> = (0..64).map(|i| Key::new(99, i)).collect();
+    let items: Vec<(usize, Hash256, Vec<u8>, Vec<u8>)> = (0..20_000u64)
+        .map(|i| {
+            let key = (i % 64) as usize;
+            let msg = sha256(&i.to_le_bytes());
+            let ecdsa = ecdsa_sig(&keys[key], msg);
+            let schnorr = SECP256K1.sign_schnorr_no_aux_rand(&msg, &keys[key].tweaked).to_byte_array().to_vec();
+            (key, msg, ecdsa, schnorr)
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let ok = items.iter().all(|(key, msg, sig, _)| consensus::crypto::ecdsa_verify(&keys[*key].public, &sig[..sig.len() - 1], msg));
+    let one = started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    let ok2 = items.par_iter().all(|(key, msg, sig, _)| consensus::crypto::ecdsa_verify(&keys[*key].public, &sig[..sig.len() - 1], msg));
+    let all = started.elapsed().as_secs_f64();
+    println!("ecdsa: {:.1} us/verify on one thread, {:.0} verifies/s on {} threads ({ok} {ok2})", one * 1e6 / items.len() as f64, items.len() as f64 / all, rayon::current_num_threads());
+    let started = std::time::Instant::now();
+    let ok = items.iter().all(|(key, msg, _, sig)| consensus::crypto::schnorr_verify(&keys[*key].output_key, msg, sig));
+    let one = started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    let ok2 = items.par_iter().all(|(key, msg, _, sig)| consensus::crypto::schnorr_verify(&keys[*key].output_key, msg, sig));
+    let all = started.elapsed().as_secs_f64();
+    println!("schnorr: {:.1} us/verify on one thread, {:.0} verifies/s on {} threads ({ok} {ok2})", one * 1e6 / items.len() as f64, items.len() as f64 / all, rayon::current_num_threads());
+}
+
+/// `bsn-txgen --bench-download HOST:PORT IN_FLIGHT`: how fast a node serves its blocks over P2P
+/// (headers first, then every block with `in_flight` requests outstanding; nothing is validated).
+pub fn bench_download(address: &str, in_flight: usize) {
+    use consensus::p2p::*;
+    use std::io::{BufReader, Read, Write};
+    let magic = [0xfa, 0xbf, 0xb5, 0xda];
+    let stream = TcpStream::connect(address).expect("connect");
+    stream.set_nodelay(true).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::with_capacity(4 << 20, stream);
+    let mut send = |command: &str, payload: &[u8]| writer.write_all(&encode_message(magic, command, payload)).unwrap();
+    let version = VersionMessage { version: PROTOCOL_VERSION, services: NODE_WITNESS, timestamp: 0, nonce: 7, user_agent: b"/bench/".to_vec(), start_height: 0, relay: false };
+    send("version", &encode_version(&version));
+    let mut read = || -> (String, Vec<u8>) {
+        let mut header = [0u8; 24];
+        reader.read_exact(&mut header).unwrap();
+        let parsed = decode_message_header(&header, magic).unwrap();
+        let mut payload = vec![0u8; parsed.length];
+        reader.read_exact(&mut payload).unwrap();
+        (parsed.command, payload)
+    };
+    let genesis = consensus::params::network_params(consensus::params::Network::Regtest, &Default::default()).consensus.genesis_hash;
+    let mut hashes: Vec<Hash256> = Vec::new();
+    let mut last = genesis;
+    let started = std::time::Instant::now();
+    let mut requested = 0usize;
+    let mut received = 0usize;
+    let mut bytes = 0usize;
+    let mut asked_headers = false;
+    loop {
+        let (command, payload) = read();
+        match command.as_str() {
+            "version" => send("verack", &[]),
+            "verack" if !asked_headers => {
+                asked_headers = true;
+                send("getheaders", &encode_getheaders(&[last], &[0u8; 32]));
+            }
+            "ping" => send("pong", &payload),
+            "headers" => {
+                let headers = decode_headers(&payload).unwrap();
+                for h in &headers {
+                    last = h.hash();
+                    hashes.push(last);
+                }
+                if headers.len() == MAX_HEADERS_RESULTS {
+                    send("getheaders", &encode_getheaders(&[last], &[0u8; 32]));
+                } else {
+                    println!("{} headers in {:.2}s", hashes.len(), started.elapsed().as_secs_f64());
+                    let items: Vec<(u32, Hash256)> = hashes.iter().take(in_flight).map(|h| (MSG_WITNESS_BLOCK, *h)).collect();
+                    requested = items.len();
+                    send("getdata", &encode_inv(&items));
+                }
+            }
+            "block" => {
+                received += 1;
+                bytes += payload.len();
+                if requested < hashes.len() {
+                    send("getdata", &encode_inv(&[(MSG_WITNESS_BLOCK, hashes[requested])]));
+                    requested += 1;
+                }
+                if received == hashes.len() {
+                    let seconds = started.elapsed().as_secs_f64();
+                    println!("{received} blocks, {:.0} MB in {seconds:.2}s: {:.0} blocks/s, {:.0} MB/s", bytes as f64 / 1e6, received as f64 / seconds, bytes as f64 / 1e6 / seconds);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
 }

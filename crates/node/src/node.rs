@@ -1,11 +1,14 @@
 //! `bitcoin-spec-node run`: the persistent full node.
 //!
 //! One thread owns the chain state (chapter 11) and handles every peer message in arrival order;
-//! block payloads are decoded (and their transactions hashed) in parallel before they reach it,
-//! and script checks run in parallel inside `connect_block`. Headers are synchronized first
-//! (chapter 14 section 14.3), then blocks are requested along the best header chain, oldest
-//! first, with a bounded number in flight per peer.
+//! block payloads are decoded (and their transactions hashed) in parallel before they reach it.
+//! The blocks of one batch of messages are stored first and connected by one chain activation, in
+//! which the script checks of a block run in parallel with the UTXO work of the next. Headers are
+//! synchronized first (chapter 14 section 14.3); blocks are requested along the best header chain,
+//! oldest first, with at most `max_in_flight` per peer, and requests are refilled by the peer reader
+//! threads as blocks arrive (`downloads.rs`), so downloading continues while blocks are connected.
 
+use crate::downloads::{DownloadState, Downloads};
 use crate::net::{connect, NetEvent};
 use crate::store::{load_index, utxo_hash_of_database, DiskStore, Hooks, IndexRecord};
 use consensus::block_rules::is_block_mutated;
@@ -41,15 +44,69 @@ pub struct NodeConfig {
     pub options: NetworkOptions,
     /// With a stop block: give up (exit with an error) after this long without progress.
     pub idle_timeout: Duration,
+    /// Without `--connect`: how many peers found through the DNS seeds to keep connected.
+    pub max_peers: usize,
+}
+
+/// DNS seeds (chapter 14 section 14.6) and the network's default port.
+fn dns_seeds(network: Network) -> &'static [&'static str] {
+    match network {
+        Network::Main => &[
+            "dnsseed.bluematt.me",
+            "seed.bitcoin.jonasschnelli.ch",
+            "seed.btc.petertodd.net",
+            "seed.bitcoin.sprovoost.nl",
+            "dnsseed.emzy.de",
+            "seed.bitcoin.wiz.biz",
+            "seed.mainnet.achownodes.xyz",
+        ],
+        Network::Testnet3 => &["testnet-seed.bitcoin.jonasschnelli.ch", "seed.tbtc.petertodd.net", "testnet-seed.bluematt.me", "seed.testnet.achownodes.xyz"],
+        Network::Testnet4 => &["seed.testnet4.bitcoin.sprovoost.nl", "seed.testnet4.wiz.biz"],
+        Network::Signet => &["seed.signet.bitcoin.sprovoost.nl", "seed.signet.achownodes.xyz"],
+        Network::Regtest => &[],
+    }
+}
+
+/// Resolves the DNS seeds into a shuffled list of `address:port` strings.
+fn resolve_seeds(network: Network, port: u16) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    let mut addresses: Vec<String> = Vec::new();
+    for seed in dns_seeds(network) {
+        match (*seed, port).to_socket_addrs() {
+            Ok(found) => addresses.extend(found.map(|a| a.to_string())),
+            Err(error) => eprintln!("DNS seed {seed}: {error}"),
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    // Shuffle (Fisher-Yates with a clock-seeded generator).
+    let mut state = random_u64() | 1;
+    for i in (1..addresses.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        addresses.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    addresses
 }
 
 /// Blocks are not requested further than this above the active tip.
 const MAX_AHEAD: i32 = 1024;
+/// At most this many blocks are requested or received and not yet processed.
+const MAX_BUFFERED: usize = 256;
+/// At most this many messages are handled before chain activation runs.
+const MAX_BATCH: usize = 512;
 /// A block requested this long ago without an answer is requested again (Bitcoin Core never sends
 /// `notfound` for blocks; chapter 14 section 14.4).
 const BLOCK_TIMEOUT: Duration = Duration::from_secs(64);
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// How often performance statistics go to standard error (`BSN_STATS_SECS`, default 10).
+fn stats_interval() -> Duration {
+    static SECONDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*SECONDS.get_or_init(|| std::env::var("BSN_STATS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10)))
+}
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -196,7 +253,8 @@ struct Peer {
     sender: Sender<Vec<u8>>,
     handshake_done: bool,
     headers_requested: Option<Instant>,
-    in_flight: usize,
+    services: u64,
+    start_height: i32,
 }
 
 pub struct Node {
@@ -208,7 +266,7 @@ pub struct Node {
     peers: HashMap<usize, Peer>,
     next_peer_id: usize,
     reconnect_at: Vec<(Instant, String)>,
-    in_flight: HashMap<Hash256, (usize, Instant)>,
+    downloads: Downloads,
     our_nonce: u64,
     pruned_to: i32,
     last_stats: Instant,
@@ -217,9 +275,21 @@ pub struct Node {
     /// Last time the best header or the active tip changed (or a block or headers arrived).
     last_progress: Instant,
     progress_marker: (EntryId, EntryId),
+    /// The wanted list was computed for this (best header, tip).
+    wanted_marker: Option<(EntryId, EntryId)>,
     /// Set when the stop block can no longer be reached.
     fatal: Option<String>,
+    /// Addresses from the DNS seeds not tried yet (discovery mode, without `--connect`).
+    candidates: Vec<String>,
+    last_resolve: Option<Instant>,
+    /// A peer that holds the next needed block longer than this is stalling.
+    stall_timeout: Duration,
+    last_stall: Instant,
 }
+
+/// Initial and maximum stall timeouts (Bitcoin Core: `BLOCK_STALLING_TIMEOUT_DEFAULT`, `_MAX`).
+const STALL_TIMEOUT_MIN: Duration = Duration::from_secs(2);
+const STALL_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 
 impl Node {
     pub fn new(config: NodeConfig) -> Result<Node, String> {
@@ -252,6 +322,7 @@ impl Node {
             chain.best_header().height,
             chain.tree.entries.len()
         );
+        let downloads = DownloadState::new(magic, config.max_in_flight, MAX_BUFFERED);
         Ok(Node {
             magic,
             pruned_to: 1,
@@ -262,15 +333,50 @@ impl Node {
             peers: HashMap::new(),
             next_peer_id: 1,
             reconnect_at: Vec::new(),
-            in_flight: HashMap::new(),
+            downloads,
             our_nonce: random_u64(),
             last_stats: Instant::now(),
             stats_blocks: 0,
             stats_txs: 0,
             last_progress: Instant::now(),
             progress_marker: (0, 0),
+            wanted_marker: None,
             fatal: None,
+            candidates: Vec::new(),
+            last_resolve: None,
+            stall_timeout: STALL_TIMEOUT_MIN,
+            last_stall: Instant::now(),
         })
+    }
+
+    /// Without `--connect`, peers come from the DNS seeds.
+    fn discovery(&self) -> bool {
+        self.config.connect.is_empty()
+    }
+
+    /// Keeps `max_peers` connections in discovery mode.
+    fn discover_peers(&mut self) {
+        if !self.discovery() {
+            return;
+        }
+        while self.peers.len() < self.config.max_peers {
+            if self.candidates.is_empty() {
+                if self.last_resolve.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+                    return;
+                }
+                self.last_resolve = Some(Instant::now());
+                self.candidates = resolve_seeds(self.config.network, self.chain.params.default_port);
+                eprintln!("DNS seeds gave {} addresses", self.candidates.len());
+                if self.candidates.is_empty() {
+                    return;
+                }
+            }
+            let address = self.candidates.pop().unwrap();
+            if self.peers.values().any(|p| p.address == address) {
+                continue;
+            }
+            self.connect_peer(address);
+        }
     }
 
     fn send(&self, peer: usize, command: &str, payload: &[u8]) {
@@ -283,8 +389,8 @@ impl Node {
         let id = self.next_peer_id;
         self.next_peer_id += 1;
         eprintln!("connecting to {address} (peer {id})");
-        connect(id, address.clone(), self.magic, self.event_sender.clone());
-        self.peers.insert(id, Peer { address, sender: crossbeam_channel::unbounded().0, handshake_done: false, headers_requested: None, in_flight: 0 });
+        connect(id, address.clone(), self.magic, self.event_sender.clone(), self.downloads.clone());
+        self.peers.insert(id, Peer { address, sender: crossbeam_channel::unbounded().0, handshake_done: false, headers_requested: None, services: 0, start_height: 0 });
     }
 
     fn request_headers(&mut self, peer: usize, from: EntryId) {
@@ -307,6 +413,7 @@ impl Node {
         for address in self.config.connect.clone() {
             self.connect_peer(address);
         }
+        self.discover_peers();
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 eprintln!("shutting down");
@@ -323,7 +430,7 @@ impl Node {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Err("event channel closed".into()),
             }
             let mut block_bytes = 0usize;
-            while batch.len() < 256 && block_bytes < (256 << 20) {
+            while batch.len() < MAX_BATCH && block_bytes < (256 << 20) {
                 match self.events.try_recv() {
                     Ok(event) => {
                         if let NetEvent::Message { command, payload, .. } = &event {
@@ -344,30 +451,64 @@ impl Node {
                     _ => None,
                 })
                 .collect();
+            // Store the blocks (and handle every other message) in arrival order, then activate
+            // once for the whole batch.
+            let mut stored = false;
             for (event, block) in batch.into_iter().zip(decoded) {
-                self.handle_event(event, block);
-                if self.stop_reached() {
-                    return self.finish();
+                match event {
+                    NetEvent::Message { peer, command, requested, .. } if command == "block" => {
+                        match block {
+                            Some(data) => {
+                                self.handle_block(peer, data, requested);
+                                stored = true;
+                            }
+                            None => eprintln!("peer {peer}: block message does not decode"),
+                        }
+                        self.downloads.lock().unwrap().processed();
+                    }
+                    other => self.handle_event(other),
                 }
                 if self.fatal.is_some() {
                     return self.fail();
                 }
             }
-            self.maintain();
+            if stored {
+                self.activate();
+            }
             if self.stop_reached() {
                 return self.finish();
             }
             if self.fatal.is_some() {
                 return self.fail();
             }
+            self.maintain();
+            if self.fatal.is_some() {
+                return self.fail();
+            }
         }
     }
 
-    fn handle_event(&mut self, event: NetEvent, block: Option<BlockData>) {
+    /// Chain activation for the blocks stored so far (chapter 11 section 11.7).
+    fn activate(&mut self) {
+        let failures = self.chain.activate_best_chain();
+        for (id, failure) in failures {
+            let hash = self.chain.tree.get(id).hash;
+            eprintln!("block {} failed to connect: {}", hash_to_display(&hash), failure.reason);
+            // A peer sent a block that fails validation: with a stop block, give up (PROTOCOL.md
+            // section 5); otherwise keep following the best valid chain.
+            if self.config.stop_at.is_some() && !self.stop_reached() {
+                self.fatal = Some(format!("peer sent an invalid block {}: {}", hash_to_display(&hash), failure.reason));
+            }
+        }
+        self.refresh_wanted();
+    }
+
+    fn handle_event(&mut self, event: NetEvent) {
         match event {
             NetEvent::Connected { peer, sender } => {
                 let Some(p) = self.peers.get_mut(&peer) else { return };
-                p.sender = sender;
+                p.sender = sender.clone();
+                self.downloads.lock().unwrap().add_peer(peer, sender);
                 let version = VersionMessage {
                     version: PROTOCOL_VERSION,
                     services: NODE_WITNESS,
@@ -380,17 +521,19 @@ impl Node {
                 self.send(peer, "version", &encode_version(&version));
             }
             NetEvent::Disconnected { peer, reason } => {
+                self.downloads.lock().unwrap().remove_peer(peer);
                 if let Some(p) = self.peers.remove(&peer) {
                     eprintln!("peer {peer} ({}) disconnected: {reason}", p.address);
-                    self.in_flight.retain(|_, (owner, _)| *owner != peer);
-                    self.reconnect_at.push((Instant::now() + Duration::from_secs(5), p.address));
+                    if !self.discovery() {
+                        self.reconnect_at.push((Instant::now() + Duration::from_secs(5), p.address));
+                    }
                 }
             }
-            NetEvent::Message { peer, command, payload } => self.handle_message(peer, &command, &payload, block),
+            NetEvent::Message { peer, command, payload, .. } => self.handle_message(peer, &command, &payload),
         }
     }
 
-    fn handle_message(&mut self, peer: usize, command: &str, payload: &[u8], block: Option<BlockData>) {
+    fn handle_message(&mut self, peer: usize, command: &str, payload: &[u8]) {
         match command {
             "version" => {
                 let Ok(theirs) = decode_version(payload) else {
@@ -405,16 +548,29 @@ impl Node {
                     self.disconnect(peer, "connected to self");
                     return;
                 }
-                eprintln!("peer {peer}: version {} {} height {}", theirs.version, String::from_utf8_lossy(&theirs.user_agent), theirs.start_height);
+                eprintln!("peer {peer}: version {} {} height {} services {:#x}", theirs.version, String::from_utf8_lossy(&theirs.user_agent), theirs.start_height, theirs.services);
+                // Blocks with witnesses from the whole history need NODE_NETWORK and NODE_WITNESS;
+                // peers found through the seeds without them are of no use for synchronizing.
+                if self.discovery() && (theirs.services & NODE_NETWORK == 0 || theirs.services & NODE_WITNESS == 0) {
+                    self.disconnect(peer, "peer does not serve the full block history with witnesses");
+                    return;
+                }
+                if let Some(p) = self.peers.get_mut(&peer) {
+                    p.services = theirs.services;
+                    p.start_height = theirs.start_height;
+                }
                 self.send(peer, "verack", &[]);
             }
             "verack" => {
+                let mut start_height = 0;
                 if let Some(p) = self.peers.get_mut(&peer) {
                     p.handshake_done = true;
+                    start_height = p.start_height;
                 }
                 self.send(peer, "sendheaders", &[]);
                 let best = self.chain.best_header;
                 self.request_headers(peer, best);
+                self.downloads.lock().unwrap().set_ready(peer, start_height);
             }
             "getheaders" => {
                 if let Ok((locator, stop)) = decode_getheaders(payload) {
@@ -428,29 +584,22 @@ impl Node {
             "headers" => self.handle_headers(peer, payload),
             "inv" => {
                 if let Ok(items) = decode_inv(payload) {
-                    let unknown = items.iter().any(|(kind, hash)| *kind & !MSG_WITNESS_FLAG == MSG_BLOCK && self.chain.tree.lookup(hash).is_none());
+                    let mut unknown = false;
+                    for (kind, hash) in &items {
+                        if *kind & !MSG_WITNESS_FLAG != MSG_BLOCK {
+                            continue;
+                        }
+                        match self.chain.tree.lookup(hash) {
+                            Some(id) => {
+                                let height = self.chain.tree.get(id).height;
+                                self.downloads.lock().unwrap().peer_has_height(peer, height);
+                            }
+                            None => unknown = true,
+                        }
+                    }
                     if unknown {
                         let best = self.chain.best_header;
                         self.request_headers(peer, best);
-                    }
-                }
-            }
-            "block" => {
-                match block {
-                    Some(data) => self.handle_block(peer, data),
-                    None => eprintln!("peer {peer}: block message does not decode"),
-                }
-                // Keep the download pipeline full while blocks are being connected.
-                self.schedule_downloads();
-            }
-            "notfound" => {
-                if let Ok(items) = decode_inv(payload) {
-                    for (_, hash) in items {
-                        if self.in_flight.remove(&hash).is_some() {
-                            if let Some(p) = self.peers.get_mut(&peer) {
-                                p.in_flight = p.in_flight.saturating_sub(1);
-                            }
-                        }
                     }
                 }
             }
@@ -461,11 +610,11 @@ impl Node {
     fn disconnect(&mut self, peer: usize, reason: &str) {
         eprintln!("disconnecting peer {peer}: {reason}");
         if let Some(p) = self.peers.get(&peer) {
-            // Dropping the sender ends the writer thread, which shuts the socket down.
+            // An empty frame makes the writer thread close the connection.
             let _ = p.sender.send(Vec::new());
         }
         self.peers.remove(&peer);
-        self.in_flight.retain(|_, (owner, _)| *owner != peer);
+        self.downloads.lock().unwrap().remove_peer(peer);
     }
 
     fn handle_headers(&mut self, peer: usize, payload: &[u8]) {
@@ -505,6 +654,10 @@ impl Node {
         if let Err(error) = self.chain.store.write_index(false) {
             eprintln!("warning: cannot write the block index: {error}");
         }
+        if let Some(last) = self.chain.tree.lookup(&headers.last().unwrap().hash()) {
+            let height = self.chain.tree.get(last).height;
+            self.downloads.lock().unwrap().peer_has_height(peer, height);
+        }
         if headers.len() == MAX_HEADERS_RESULTS {
             if let Some(last) = self.chain.tree.lookup(&headers.last().unwrap().hash()) {
                 self.request_headers(peer, last);
@@ -513,18 +666,12 @@ impl Node {
             let best = self.chain.best_header();
             eprintln!("headers synchronized with peer {peer}: best header {} at height {}", hash_to_display(&best.hash), best.height);
         }
+        self.refresh_wanted();
     }
 
-    fn handle_block(&mut self, peer: usize, data: BlockData) {
-        let requested = match self.in_flight.remove(&data.hash) {
-            Some((owner, _)) => {
-                if let Some(p) = self.peers.get_mut(&owner) {
-                    p.in_flight = p.in_flight.saturating_sub(1);
-                }
-                true
-            }
-            None => false,
-        };
+    /// Stores a block received from a peer (chapter 14 section 14.4, then chapter 11 section 11.6
+    /// steps 1 to 6; activation runs once per batch).
+    fn handle_block(&mut self, peer: usize, data: BlockData, requested: bool) {
         self.last_progress = Instant::now();
         if let Some(parent) = self.chain.tree.lookup(&data.block.header.prev_block) {
             let segwit_active = self.chain.tree.get(parent).height + 1 >= self.chain.params.consensus.segwit_height;
@@ -539,13 +686,10 @@ impl Node {
         }
         let hash = data.hash;
         let txs = data.block.transactions.len() as u64;
-        let outcome = self.chain.process_block(Arc::new(data), unix_now(), requested);
-        match outcome {
+        match self.chain.store_block(Arc::new(data), unix_now(), requested) {
             BlockOutcome::Rejected(failure) => {
                 eprintln!("block {} rejected: {} ({:?})", hash_to_display(&hash), failure.reason, failure.kind);
-                // The peer sent a block that fails validation: with a stop block, give up (PROTOCOL.md
-                // section 5); otherwise keep following the best valid chain.
-                if failure.kind == FailureKind::Invalid && self.config.stop_at.is_some() && self.config.stop_at != Some(self.chain.tip().hash) {
+                if failure.kind == FailureKind::Invalid && self.config.stop_at.is_some() && !self.stop_reached() {
                     self.fatal = Some(format!("peer sent an invalid block {}: {}", hash_to_display(&hash), failure.reason));
                 }
             }
@@ -557,7 +701,52 @@ impl Node {
         }
     }
 
-    /// Requests blocks, re-requests stalled ones, reconnects, prunes and reports.
+    /// The missing blocks along the best header chain, oldest first (chapter 14 section 14.4).
+    fn refresh_wanted(&mut self) {
+        let best = self.chain.best_header;
+        let tip = self.chain.tree.tip();
+        if self.wanted_marker == Some((best, tip)) {
+            return;
+        }
+        self.wanted_marker = Some((best, tip));
+        let tree = &self.chain.tree;
+        let tip_height = tree.get(tip).height;
+        let best_height = tree.get(best).height;
+        let mut wanted: Vec<(Hash256, i32)> = Vec::new();
+        let fork = tree.find_fork(best);
+        if fork != best {
+            let mut limit_height = best_height.min(tip_height + MAX_AHEAD);
+            if let Some(stop) = self.config.stop_at {
+                if let Some(stop_id) = tree.lookup(&stop) {
+                    let stop_height = tree.get(stop_id).height;
+                    if stop_height <= best_height && tree.ancestor(best, stop_height) == Some(stop_id) {
+                        limit_height = limit_height.min(stop_height);
+                    }
+                }
+            }
+            let start = tree.get(fork).height.min(tip_height) + 1;
+            if start <= limit_height {
+                let mut id = tree.ancestor(best, limit_height).unwrap();
+                loop {
+                    let entry = tree.get(id);
+                    if entry.height < start {
+                        break;
+                    }
+                    if !entry.has_data && !entry.failed {
+                        wanted.push((entry.hash, entry.height));
+                    }
+                    match entry.parent {
+                        Some(parent) => id = parent,
+                        None => break,
+                    }
+                }
+                wanted.reverse();
+            }
+        }
+        self.downloads.lock().unwrap().set_wanted(wanted);
+    }
+
+    /// Re-requests stalled blocks, reconnects, prunes, watches progress and reports.
     fn maintain(&mut self) {
         let now = Instant::now();
         let due: Vec<String> = self.reconnect_at.iter().filter(|(when, _)| *when <= now).map(|(_, a)| a.clone()).collect();
@@ -565,15 +754,32 @@ impl Node {
         for address in due {
             self.connect_peer(address);
         }
-        // Stalled requests.
-        let stalled: Vec<Hash256> = self.in_flight.iter().filter(|(_, (_, at))| at.elapsed() > BLOCK_TIMEOUT).map(|(h, _)| *h).collect();
-        for hash in stalled {
-            if let Some((owner, _)) = self.in_flight.remove(&hash) {
-                if let Some(p) = self.peers.get_mut(&owner) {
-                    p.in_flight = p.in_flight.saturating_sub(1);
+        self.discover_peers();
+        let expired = self.downloads.lock().unwrap().expire(BLOCK_TIMEOUT);
+        if expired > 0 {
+            eprintln!("{expired} block requests timed out; requesting them again");
+        }
+        // A peer holding up the next block while others could deliver it is stalling: drop it
+        // (discovery mode, where it is replaced) or ask someone else (Bitcoin Core: stalling).
+        let (oldest, ready) = {
+            let downloads = self.downloads.lock().unwrap();
+            (downloads.oldest_needed(), downloads.ready_peers())
+        };
+        if let Some((staller, waited, height)) = oldest {
+            if ready > 1 && height == self.chain.tip().height + 1 && waited > self.stall_timeout {
+                eprintln!("peer {staller} stalls block {height} ({} s); stall timeout now {} s", waited.as_secs(), (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX).as_secs());
+                self.stall_timeout = (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX);
+                self.last_stall = Instant::now();
+                if self.discovery() {
+                    self.disconnect(staller, "stalling");
+                } else {
+                    self.downloads.lock().unwrap().expire(waited.saturating_sub(Duration::from_millis(1)));
                 }
-                eprintln!("block {} timed out; requesting it again", hash_to_display(&hash));
             }
+        }
+        if self.last_stall.elapsed() > Duration::from_secs(60) && self.stall_timeout > STALL_TIMEOUT_MIN {
+            self.stall_timeout /= 2;
+            self.last_stall = Instant::now();
         }
         // Headers requests that went unanswered.
         let silent: Vec<usize> = self.peers.iter().filter(|(_, p)| p.headers_requested.is_some_and(|at| at.elapsed() > Duration::from_secs(120))).map(|(id, _)| *id).collect();
@@ -581,7 +787,7 @@ impl Node {
             let best = self.chain.best_header;
             self.request_headers(peer, best);
         }
-        self.schedule_downloads();
+        self.refresh_wanted();
         // Progress, and giving up on an unreachable stop block.
         let marker = (self.chain.best_header, self.chain.tree.tip());
         if marker != self.progress_marker {
@@ -597,18 +803,23 @@ impl Node {
             self.chain.prune_active(self.pruned_to, keep_from);
             self.pruned_to = keep_from;
         }
-        if self.last_stats.elapsed() >= Duration::from_secs(10) {
+        if self.last_stats.elapsed() >= stats_interval() {
             let seconds = self.last_stats.elapsed().as_secs_f64();
             let tip = self.chain.tip();
             let (phases, inputs) = consensus::chain::timing::take();
+            let (in_flight, buffered) = {
+                let downloads = self.downloads.lock().unwrap();
+                (downloads.in_flight_count(), downloads.buffered())
+            };
             eprintln!(
-                "height {} ({} headers): {:.1} blocks/s, {:.0} tx/s, {:.0} inputs/s; in flight {}; cache {} MiB, {} entries; ms checks {} prefetch {} serial {} scripts {} wait {} apply {}",
+                "height {} ({} headers): {:.1} blocks/s, {:.0} tx/s, {:.0} coins/s; in flight {}, buffered {}; cache {} MiB, {} entries; ms checks {} prefetch {} serial {} scripts {} wait {} apply {}",
                 tip.height,
                 self.chain.best_header().height,
                 self.stats_blocks as f64 / seconds,
                 self.stats_txs as f64 / seconds,
                 inputs as f64 / seconds,
-                self.in_flight.len(),
+                in_flight,
+                buffered,
                 self.chain.store.coins_usage() >> 20,
                 self.chain.store.coins_entries(),
                 phases[0],
@@ -621,80 +832,6 @@ impl Node {
             self.last_stats = Instant::now();
             self.stats_blocks = 0;
             self.stats_txs = 0;
-        }
-    }
-
-    /// Requests missing blocks along the best header chain, oldest first (chapter 14 section 14.4).
-    fn schedule_downloads(&mut self) {
-        let ready: Vec<usize> = self.peers.iter().filter(|(_, p)| p.handshake_done && p.in_flight < self.config.max_in_flight).map(|(id, _)| *id).collect();
-        if ready.is_empty() {
-            return;
-        }
-        let best = self.chain.best_header;
-        let tree = &self.chain.tree;
-        let tip_height = self.chain.tip().height;
-        let best_height = tree.get(best).height;
-        if best_height <= tip_height && tree.find_fork(best) == best {
-            return;
-        }
-        let mut limit_height = best_height.min(tip_height + MAX_AHEAD);
-        if let Some(stop) = self.config.stop_at {
-            if let Some(stop_id) = tree.lookup(&stop) {
-                let stop_height = tree.get(stop_id).height;
-                if stop_height <= best_height && tree.ancestor(best, stop_height) == Some(stop_id) {
-                    limit_height = limit_height.min(stop_height);
-                }
-            }
-        }
-        let fork_height = tree.get(tree.find_fork(best)).height;
-        let start = fork_height.min(tip_height) + 1;
-        let mut capacity: Vec<(usize, usize)> = ready.iter().map(|id| (*id, self.config.max_in_flight - self.peers[id].in_flight)).collect();
-        let total_capacity: usize = capacity.iter().map(|(_, c)| c).sum();
-        let mut wanted: Vec<Hash256> = Vec::new();
-        if start <= limit_height {
-            let mut id = tree.ancestor(best, limit_height).unwrap();
-            // Walk down from the limit to `start`, then reverse (oldest first).
-            let mut candidates = Vec::new();
-            loop {
-                let entry = tree.get(id);
-                if entry.height < start {
-                    break;
-                }
-                candidates.push(id);
-                match entry.parent {
-                    Some(parent) => id = parent,
-                    None => break,
-                }
-            }
-            candidates.reverse();
-            for id in candidates {
-                if wanted.len() >= total_capacity {
-                    break;
-                }
-                let entry = tree.get(id);
-                if !entry.has_data && !entry.failed && !self.in_flight.contains_key(&entry.hash) {
-                    wanted.push(entry.hash);
-                }
-            }
-        }
-        let mut per_peer: HashMap<usize, Vec<(u32, Hash256)>> = HashMap::new();
-        let mut slot = 0;
-        for hash in wanted {
-            while capacity[slot % capacity.len()].1 == 0 {
-                slot += 1;
-            }
-            let index = slot % capacity.len();
-            capacity[index].1 -= 1;
-            let peer = capacity[index].0;
-            per_peer.entry(peer).or_default().push((MSG_WITNESS_BLOCK, hash));
-            self.in_flight.insert(hash, (peer, Instant::now()));
-            slot += 1;
-        }
-        for (peer, items) in per_peer {
-            if let Some(p) = self.peers.get_mut(&peer) {
-                p.in_flight += items.len();
-            }
-            self.send(peer, "getdata", &encode_inv(&items));
         }
     }
 
