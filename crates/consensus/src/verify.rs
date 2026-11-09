@@ -10,6 +10,7 @@ use crate::util::Hash256;
 
 /// Core: `VerifyScript`.
 pub fn verify_script(script_sig: &[u8], script_pubkey: &[u8], witness: &[Vec<u8>], flags: ScriptFlags, checker: &TxChecker) -> Result<(), ScriptError> {
+    assert!((flags & VERIFY_WITNESS) == 0 || (flags & VERIFY_P2SH) != 0, "WITNESS requires P2SH");
     let mut had_witness = false;
     let mut stack: Vec<Vec<u8>> = Vec::new();
 

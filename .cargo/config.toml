@@ -1,0 +1,3 @@
+# librocksdb-sys generates its bindings with bindgen, which loads libclang at run time.
+[env]
+LIBCLANG_PATH = "/Library/Developer/CommandLineTools/usr/lib"

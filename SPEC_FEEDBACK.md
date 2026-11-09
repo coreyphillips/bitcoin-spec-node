@@ -13,7 +13,8 @@ Spec 3.4 says a block that cannot be decoded is "handled like a `Mutated` failur
 PROTOCOL.md 4.9 lists `mutated` with an optional `reason`, but no reason identifier is given for a
 decode failure (Bitcoin Core's `submitblock` says "Block decode failed"; over P2P the message is
 just dropped). Assumed: `{"result":"mutated","reason":"block-decode"}`.
-Status: open (no corpus file exercises it yet).
+Status: settled by errata 1: PROTOCOL.md 4.9 now says undecodable bytes give `mutated` with an
+implementation-defined reason.
 
 ### F2. PROTOCOL.md 4.10: result when a whole `headers` message is dropped
 
@@ -46,7 +47,7 @@ the reason for a block already known to be invalid, which is what the harness re
 CORPUS.md section 7 still says "`PROTOCOL.md` 4.10 `chain_process_headers` does not list a `via`
 field", while the updated PROTOCOL.md 4.10 does list it (with the message-level checks for `p2p`).
 Harmless (the harness reads `via` either way), but one of the two documents is stale.
-Status: open (documentation only).
+Status: fixed by errata 1 (the stale note is gone).
 
 ### F5. Chapter 11: candidate set after a tip moves, and the old tip after a failed reorganization
 
@@ -57,4 +58,24 @@ connection. The prose of 11.7 does not say this; it is only visible in the code.
 that rebuild candidates differently (for example "only blocks with more work than the tip") would
 not return to the old chain. Assumed and implemented exactly as the code does; the corpus
 (`feature_block`, `p2p_invalid_block`) passes with it.
-Status: confirmed by the corpus replay (level 0 and level 1 all pass).
+Status: confirmed by the corpus replay (level 0 and level 1 all pass); errata 1 added this
+explanation to the prose of 11.7.
+
+## Found after errata 1
+
+### F6. Chapter 11/12/14: per-network minimum chain work values are not given
+
+`ChainState.minimum_chain_work` (11.3) and `anti_dos_work_threshold` (14.4) use Bitcoin Core's
+`nMinimumChainWork`, but chapter 12 lists no value for any network; the reference starts at zero
+("the regtest default"). For a live node on mainnet the value only matters for unrequested blocks
+and for low-work header chains from untrusted peers. Assumed: zero on every network (the node
+connects only to peers it is told to use). A node that wants Core's behaviour against hostile
+peers would need the values. Status: open (no test depends on it).
+
+### F7. Chapter 14 section 14.4 / PROTOCOL.md 4.9: reason for a block dropped by the work check
+
+14.4 says Core reports `too-little-chainwork` "only after the context-free block checks and the
+header checks have passed", while PROTOCOL.md 4.9 just lists `invalid` / `too-little-chainwork`.
+The reference API has no side-effect-free way to run the contextual header checks for a block that
+must not be stored. Assumed: the harness reports the `check_block` failure if there is one, else
+`too-little-chainwork`. Diagnostic only. Status: open.

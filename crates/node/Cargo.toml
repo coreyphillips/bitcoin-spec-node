@@ -12,3 +12,7 @@ path = "src/main.rs"
 bsn-consensus = { path = "../consensus" }
 serde_json = "1"
 rayon = "1"
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+crossbeam-channel = "0.5"
+libc = "0.2"
+ctrlc = { version = "3", features = ["termination"] }

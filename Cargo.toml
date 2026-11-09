@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/consensus", "crates/node", "tools/replay"]
+members = ["crates/consensus", "crates/node", "tools/replay", "tools/txgen"]
 exclude = ["spec-package"]
 
 [workspace.package]

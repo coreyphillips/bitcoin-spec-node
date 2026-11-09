@@ -2,8 +2,8 @@
 //!
 //! Chain operations use the same `ChainState` code as the node, with an in-memory store.
 
-use consensus::block_rules::{block_merkle_root, check_witness_malleation, is_block_mutated};
-use consensus::chain::{headers_message_acceptable, BlockOutcome, ChainState, HeaderError, MemoryStore};
+use consensus::block_rules::{block_merkle_root, check_block, check_witness_malleation, is_block_mutated};
+use consensus::chain::{headers_message_acceptable, p2p_block_work_acceptable, BlockOutcome, ChainState, HeaderError, MemoryStore};
 use consensus::crypto::schnorr_verify;
 use consensus::hashes::sha256;
 use consensus::interpreter::{ExecData, ScriptFlags, SigVersion, TxChecker, FLAG_NAMES};
@@ -309,6 +309,16 @@ impl Harness {
                     return result(fields);
                 }
             }
+            // Chapter 14 section 14.4: a new header with too little work is dropped, recording
+            // nothing (Core reports it after the context-free block checks).
+            if !p2p_block_work_acceptable(chain, &data.block.header, &data.hash) {
+                let mut fields = match check_block(&data, &chain.params.consensus) {
+                    Err(failure) => vec![("result", json!(kind_name(failure.kind))), ("reason", json!(failure.reason))],
+                    Ok(()) => vec![("result", json!("invalid")), ("reason", json!("too-little-chainwork"))],
+                };
+                fields.extend(self.tip_fields()?);
+                return result(fields);
+            }
         }
         let requested = via != "p2p" || requested;
         let outcome = chain.process_block(Arc::new(data), now, requested);
@@ -337,14 +347,10 @@ impl Harness {
         let mut fields: Vec<(&str, Value)> = Vec::new();
         let acceptable = if via == "p2p" { headers_message_acceptable(chain, &headers) } else { Ok(()) };
         match acceptable {
-            Err((index, reason)) => {
-                if reason == "prev-blk-not-found" {
-                    fields.push(("result", json!("orphan")));
-                } else {
-                    fields.push(("result", json!("invalid")));
-                }
-                fields.push(("reason", json!(reason)));
-                fields.push(("index", json!(index)));
+            Err(_) => {
+                // PROTOCOL.md 4.10: a message dropped as a whole has no index.
+                fields.push(("result", json!("invalid")));
+                fields.push(("reason", json!("headers-message-rejected")));
             }
             Ok(()) => match chain.process_headers(&headers, now) {
                 Ok(()) => fields.push(("result", json!("accepted"))),
@@ -390,6 +396,12 @@ fn mutation_reason(data: &consensus::tx::BlockData, segwit_active: bool) -> Stri
         Err(failure) => failure.reason,
         Ok(()) => "mutated".into(),
     }
+}
+
+/// Parses network options given as JSON text (the `{options}` of PROTOCOL.md section 5).
+pub fn parse_options_json(text: &str) -> Result<NetworkOptions, String> {
+    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    parse_options(Some(&value)).map_err(|e| e.message)
 }
 
 fn parse_options(value: Option<&Value>) -> Result<NetworkOptions, OpError> {

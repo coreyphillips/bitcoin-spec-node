@@ -200,6 +200,8 @@ pub trait ChainStore {
     }
     /// The tip was disconnected.
     fn disconnected(&mut self, _tree: &BlockTree, _id: EntryId) {}
+    /// Discards the stored data and undo data of a block (pruning).
+    fn remove_data(&mut self, _entry: &BlockEntry) {}
 }
 
 /// Core: `MIN_BLOCKS_TO_KEEP`.
@@ -219,6 +221,10 @@ pub struct ChainState<S: ChainStore> {
     pub best_header: EntryId,
     /// Set when a store hook stopped activation.
     pub halted: bool,
+    /// Bitcoin Core's minimum chain work (peer-to-peer policy, not consensus): unrequested blocks
+    /// with less chain work are reduced to their header (section 11.6 step 4), and it floors the
+    /// anti-denial-of-service work threshold of chapter 14. Zero, the regtest default, unless set.
+    pub minimum_chain_work: U256,
 }
 
 impl<S: ChainStore> ChainState<S> {
@@ -259,6 +265,7 @@ impl<S: ChainStore> ChainState<S> {
             next_header_order: 1,
             best_header: id,
             halted: false,
+            minimum_chain_work: U256::ZERO,
         }
     }
 
@@ -303,18 +310,7 @@ impl<S: ChainStore> ChainState<S> {
             };
             tree.get_mut(id).sequence_id = sequence;
         }
-        let mut best_header = 0;
-        let mut next_header_order = 0;
-        for (index, entry) in tree.entries.iter().enumerate() {
-            next_header_order = next_header_order.max(entry.header_order + 1);
-            if entry.failed {
-                continue;
-            }
-            let best = tree.get(best_header);
-            if entry.chain_work > best.chain_work || (entry.chain_work == best.chain_work && entry.header_order < best.header_order) {
-                best_header = index as EntryId;
-            }
-        }
+        let next_header_order = tree.entries.iter().map(|entry| entry.header_order + 1).max().unwrap_or(1);
         let mut state = ChainState {
             params,
             tree,
@@ -323,9 +319,11 @@ impl<S: ChainStore> ChainState<S> {
             unlinked: HashMap::new(),
             next_sequence_id,
             next_header_order,
-            best_header,
+            best_header: 0,
             halted: false,
+            minimum_chain_work: U256::ZERO,
         };
+        state.recalculate_best_header();
         let tip = state.tree.tip();
         state.candidates.insert(tip);
         for index in 0..state.tree.entries.len() {
@@ -449,19 +447,27 @@ impl<S: ChainStore> ChainState<S> {
         Ok(())
     }
 
-    /// Recomputes the best header after blocks were marked invalid. Core: `RecalculateBestHeader`.
+    /// Recomputes the best header after blocks were marked invalid: the most work, then the active
+    /// tip, then the first accepted. Core: `RecalculateBestHeader`.
     fn recalculate_best_header(&mut self) {
+        let tip = self.tree.tip();
         let mut best: Option<EntryId> = None;
         for (index, entry) in self.tree.entries.iter().enumerate() {
             if entry.failed {
                 continue;
             }
+            let id = index as EntryId;
             best = match best {
-                None => Some(index as EntryId),
+                None => Some(id),
                 Some(current) => {
                     let current_entry = self.tree.get(current);
-                    if entry.chain_work > current_entry.chain_work || (entry.chain_work == current_entry.chain_work && entry.header_order < current_entry.header_order) {
-                        Some(index as EntryId)
+                    let ordering = entry
+                        .chain_work
+                        .cmp(&current_entry.chain_work)
+                        .then((id == tip).cmp(&(current == tip)))
+                        .then(current_entry.header_order.cmp(&entry.header_order));
+                    if ordering == std::cmp::Ordering::Greater {
+                        Some(id)
                     } else {
                         Some(current)
                     }
@@ -492,7 +498,7 @@ impl<S: ChainStore> ChainState<S> {
         if !requested {
             let entry = self.tree.get(id);
             let tip = self.tip();
-            if entry.chain_work < tip.chain_work || entry.height > tip.height + MIN_BLOCKS_TO_KEEP {
+            if entry.chain_work < tip.chain_work || entry.height > tip.height + MIN_BLOCKS_TO_KEEP || entry.chain_work < self.minimum_chain_work {
                 self.activate_best_chain();
                 return BlockOutcome::AcceptedHeaderOnly;
             }
@@ -518,8 +524,11 @@ impl<S: ChainStore> ChainState<S> {
         self.store.put_block(self.tree.get(id), block);
         self.store.entry_changed(id, self.tree.get(id));
         self.link(id);
-        self.activate_best_chain();
-        BlockOutcome::Accepted
+        // A failure of this very block is reported; a failure of an ancestor leaves `Accepted`.
+        match self.activate_best_chain().into_iter().find(|(failed, _)| *failed == id) {
+            Some((_, failure)) => BlockOutcome::Rejected(failure),
+            None => BlockOutcome::Accepted,
+        }
     }
 
     /// Assigns sequence numbers to `id` and any waiting descendants, or queues it until its parent
@@ -642,8 +651,8 @@ impl<S: ChainStore> ChainState<S> {
         let id = self.tree.active.pop().expect("never disconnect genesis");
         assert!(!self.tree.active.is_empty(), "never disconnect genesis");
         let entry = self.tree.get(id).clone();
-        let block = self.store.get_block(&entry).expect("disconnected block has data");
-        let undo = self.store.get_undo(&entry).expect("disconnected block has undo data");
+        let block = self.store.get_block(&entry).expect("a block to disconnect must have data (pruned too deep?)");
+        let undo = self.store.get_undo(&entry).expect("a block to disconnect must have undo data (pruned too deep?)");
         let coins = self.store.coins();
         for (index, tx) in block.block.transactions.iter().enumerate().rev() {
             let txid = block.tx_info[index].txid;
@@ -662,18 +671,20 @@ impl<S: ChainStore> ChainState<S> {
         self.store.disconnected(&self.tree, id);
     }
 
-    /// Core: `Chainstate::ActivateBestChain`.
-    pub fn activate_best_chain(&mut self) {
+    /// Core: `Chainstate::ActivateBestChain`. Returns the blocks that failed to connect, with their
+    /// failures.
+    pub fn activate_best_chain(&mut self) -> Vec<(EntryId, Failure)> {
+        let mut failures = Vec::new();
         loop {
             if self.halted {
-                return;
+                return failures;
             }
             let best = match self.find_most_work_chain() {
                 Some(best) => best,
-                None => return,
+                None => return failures,
             };
             if best == self.tree.tip() {
-                return;
+                return failures;
             }
             let fork = self.tree.find_fork(best);
             while self.tree.tip() != fork {
@@ -688,11 +699,12 @@ impl<S: ChainStore> ChainState<S> {
                         self.prune_candidates();
                         if !self.store.connected(&self.tree, id) {
                             self.halted = true;
-                            return;
+                            return failures;
                         }
                     }
-                    Err(_) => {
+                    Err(failure) => {
                         self.mark_invalid(id);
+                        failures.push((id, failure));
                         break;
                     }
                 }
@@ -769,29 +781,95 @@ impl<S: ChainStore> ChainState<S> {
         tips
     }
 
+    /// Prunes the block and undo data of the active blocks at heights `from..to` (a node may do
+    /// this after connecting them; a reorganization can then not go below `to`).
+    pub fn prune_active(&mut self, from: i32, to: i32) {
+        let to = to.min(self.tree.active.len() as i32);
+        for height in from.max(1)..to {
+            let id = self.tree.active[height as usize];
+            let entry = self.tree.get(id);
+            if entry.has_data || entry.has_undo {
+                self.store.remove_data(entry);
+                let entry = self.tree.get_mut(id);
+                entry.has_data = false;
+                entry.has_undo = false;
+                self.store.entry_changed(id, self.tree.get(id));
+            }
+        }
+    }
+
     /// Chapter 15 fingerprint of the active chain's UTXO set (flushes the cache first).
     pub fn utxo_hash(&mut self) -> std::io::Result<(Hash256, u64)> {
         let coins = self.store.coins();
-        coins.flush(true)?;
+        coins.flush()?;
         crate::coins::utxo_hash_of_db(coins.db())
     }
 }
 
-/// Core: the message-level checks of `PeerManagerImpl::ProcessHeadersMessage`. Returns `Ok` if the
-/// message is processed at all, else the index of the offending header and why.
-pub fn headers_message_acceptable<S: ChainStore>(state: &ChainState<S>, headers: &[BlockHeader]) -> Result<(), (usize, &'static str)> {
+/// Core: `PeerManagerImpl::GetAntiDoSWorkThreshold` (chapter 14 section 14.4): the tip's work minus
+/// 144 blocks of work at the tip's difficulty, but at least the minimum chain work.
+pub fn anti_dos_work_threshold<S: ChainStore>(state: &ChainState<S>) -> U256 {
+    let tip = state.tip();
+    let buffer = block_proof(tip.header.bits).wrapping_mul(U256::from_u64(144));
+    let near_tip = if buffer > tip.chain_work { U256::ZERO } else { tip.chain_work.wrapping_sub(buffer) };
+    std::cmp::max(near_tip, state.minimum_chain_work)
+}
+
+/// Whether a block that arrived in a `block` message may be processed (chapter 14 section 14.4).
+/// Core: the `BLOCK` case of `ProcessMessage` (`min_pow_checked`) and `AcceptBlockHeader`.
+pub fn p2p_block_work_acceptable<S: ChainStore>(state: &ChainState<S>, header: &BlockHeader, hash: &Hash256) -> bool {
+    if state.tree.lookup(hash).is_some() {
+        return true;
+    }
+    match state.tree.lookup(&header.prev_block) {
+        // An orphan; `process_block` discards it.
+        None => true,
+        Some(parent) => state.tree.get(parent).chain_work.wrapping_add(block_proof(header.bits)) >= anti_dos_work_threshold(state),
+    }
+}
+
+/// Why `headers_message_acceptable` drops a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadersRejection {
+    /// A header fails its own proof of work (misbehaviour).
+    BadProofOfWork,
+    /// The headers do not form a continuous chain (misbehaviour).
+    NonContinuous,
+    /// The first header's parent is unknown (Core asks for headers again).
+    UnknownParent,
+    /// The chain's claimed work is below the anti-denial-of-service threshold.
+    LowWork,
+}
+
+/// Core: the message-level checks of `PeerManagerImpl::ProcessHeadersMessage`, `CheckHeadersPoW`,
+/// `TryLowWorkHeadersSync`, `IsAncestorOfBestHeaderOrTip` (chapter 14 section 14.3).
+pub fn headers_message_acceptable<S: ChainStore>(state: &ChainState<S>, headers: &[BlockHeader]) -> Result<(), HeadersRejection> {
     if headers.is_empty() {
         return Ok(());
     }
     let pow_limit = state.params.consensus.pow_limit;
-    if let Some(index) = headers.iter().position(|header| !crate::pow::check_proof_of_work(&header.hash(), header.bits, pow_limit)) {
-        return Err((index, "high-hash"));
+    let hashes: Vec<Hash256> = headers.iter().map(|header| header.hash()).collect();
+    if headers.iter().zip(&hashes).any(|(header, hash)| !crate::pow::check_proof_of_work(hash, header.bits, pow_limit)) {
+        return Err(HeadersRejection::BadProofOfWork);
     }
-    if let Some(index) = headers.windows(2).position(|pair| pair[1].prev_block != pair[0].hash()) {
-        return Err((index + 1, "bad-headers-noncontinuous"));
+    if headers.windows(2).zip(hashes.iter()).any(|(pair, first_hash)| pair[1].prev_block != *first_hash) {
+        return Err(HeadersRejection::NonContinuous);
     }
-    if state.tree.lookup(&headers[0].prev_block).is_none() {
-        return Err((0, "prev-blk-not-found"));
+    let parent = match state.tree.lookup(&headers[0].prev_block) {
+        Some(parent) => parent,
+        None => return Err(HeadersRejection::UnknownParent),
+    };
+    let last = *hashes.last().expect("not empty");
+    let last_already_on_best = state.tree.lookup(&last).is_some_and(|id| {
+        let height = state.tree.get(id).height;
+        state.tree.ancestor(state.best_header, height) == Some(id) || state.tree.is_active(id)
+    });
+    if last_already_on_best {
+        return Ok(());
+    }
+    let claimed_work = headers.iter().fold(state.tree.get(parent).chain_work, |work, header| work.wrapping_add(block_proof(header.bits)));
+    if claimed_work < anti_dos_work_threshold(state) {
+        return Err(HeadersRejection::LowWork);
     }
     Ok(())
 }
@@ -1009,6 +1087,10 @@ fn verify_block_scripts(transactions: &[Transaction], script_data: &[Option<TxSc
 // ---------------------------------------------------------------------------------------------
 // An in-memory store (the harness, and tests).
 
+/// Coin cache size of the in-memory store. Deliberately small, so that the harness also
+/// exercises flushing and reading coins back from the backend.
+pub const MEMORY_STORE_CACHE_ENTRIES: usize = 448;
+
 /// Keeps block data, undo data and the coin backend in memory.
 pub struct MemoryStore {
     pub coins: CoinsCache,
@@ -1019,7 +1101,7 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new(genesis_hash: Hash256) -> MemoryStore {
         MemoryStore {
-            coins: CoinsCache::new(Box::<crate::coins::MemoryCoinDb>::default(), genesis_hash),
+            coins: CoinsCache::new(Box::<crate::coins::MemoryCoinDb>::default(), genesis_hash, MEMORY_STORE_CACHE_ENTRIES),
             blocks: HashMap::new(),
             undo: HashMap::new(),
         }
@@ -1045,5 +1127,12 @@ impl ChainStore for MemoryStore {
 
     fn get_undo(&mut self, entry: &BlockEntry) -> Option<BlockUndo> {
         self.undo.get(&entry.hash).cloned()
+    }
+
+    fn connected(&mut self, _tree: &BlockTree, _id: EntryId) -> bool {
+        if self.coins.needs_flush(MEMORY_STORE_CACHE_ENTRIES / 4) {
+            self.coins.flush().expect("in-memory flush");
+        }
+        true
     }
 }
