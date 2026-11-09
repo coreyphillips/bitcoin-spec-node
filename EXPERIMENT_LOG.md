@@ -529,3 +529,23 @@ p2p_segwit.node1                                 268    match    16.4s  tip 025e
 
 RESULT: PASS
 ```
+
+## Bugs found
+
+Every bug found so far, with its root cause and whether the specification was at fault. (The
+first runs of every conformance suite passed, so these are all bugs of the node around the
+consensus code, found by my own tests.)
+
+1. **`find_and_delete` rewrite lost bytes before the first match** (M1, found before the first
+   conformance run by the randomized differential test against the reference function). My
+   borrowing version copied only from the current operation instead of the start of the script
+   when the first match was found. Not a specification problem.
+2. **Restart could stall forever** (M4, found by the SIGKILL scenario of `tools/regtest.py` after
+   the switch to batched activation). After a restart, blocks that had been stored on disk above
+   the last flushed tip were linked and were candidates, but chain activation only ran when a new
+   block arrived; when every remaining block up to the stop block was already stored, nothing
+   arrived and the node waited until `--idle-timeout`. Fixed by activating once at startup (as
+   Core's startup `ActivateBestChain` does). Not a specification problem; the spec's 11.12 says a
+   production node must behave as if every block went through `process_block`, which activates.
+   The build of commit `7ddd347` (used for the testnet4 holdout run) has this bug; it can only
+   show after a restart.

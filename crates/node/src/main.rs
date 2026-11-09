@@ -131,6 +131,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("bench-flush") => {
+            // Diagnostics: bitcoin-spec-node bench-flush <dir> <millions of coins>
+            let dir = std::path::PathBuf::from(args.get(1).cloned().unwrap_or_else(|| usage()));
+            let millions: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+            if let Err(error) = store::bench_flush(&dir, millions) {
+                eprintln!("bench-flush: {error}");
+                std::process::exit(1);
+            }
+        }
         _ => usage(),
     }
 }

@@ -407,6 +407,12 @@ impl Node {
     }
 
     pub fn run(mut self) -> Result<(), String> {
+        // Blocks stored before a restart (above the last flushed tip) are connected now, as Core's
+        // startup `ActivateBestChain` does; nothing else would trigger their activation.
+        self.activate();
+        if self.fatal.is_some() {
+            return self.fail();
+        }
         if self.stop_reached() {
             return self.finish();
         }

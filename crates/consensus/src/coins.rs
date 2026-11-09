@@ -217,6 +217,19 @@ pub trait CoinDb: Send + Sync {
     /// `best` as the block whose UTXO set the database now holds.
     fn write(&mut self, changes: &mut dyn Iterator<Item = (OutPoint, Option<CoinRef<'_>>)>, best: &Hash256) -> std::io::Result<()>;
 
+    /// Like `write`, for changes produced in `parts` key ranges: `produce(p, sink)` feeds the
+    /// changes of range `p` to `sink` in ascending order, and every key of range `p` sorts before
+    /// every key of range `p + 1`. Implementations may produce and write the ranges in parallel;
+    /// the result must still be applied atomically.
+    fn write_parts(&mut self, parts: usize, produce: &(dyn Fn(usize, &mut dyn FnMut(OutPoint, Option<CoinRef<'_>>)) + Sync), best: &Hash256) -> std::io::Result<()> {
+        let mut owned: Vec<(OutPoint, Option<Coin>)> = Vec::new();
+        for part in 0..parts {
+            produce(part, &mut |outpoint, coin| owned.push((outpoint, coin.map(|c| c.to_coin()))));
+        }
+        let mut iter = owned.iter().map(|(outpoint, coin)| (*outpoint, coin.as_ref().map(CoinRef::of)));
+        self.write(&mut iter, best)
+    }
+
     /// The block whose UTXO set the database holds, if any was recorded.
     fn best_block(&self) -> Option<Hash256>;
 
@@ -580,41 +593,34 @@ impl CoinsCache {
     }
 
     /// Writes every pending change to the backend atomically, recording `best_block`, then
-    /// empties the cache. Changes are produced in key order, one quarter of the key space at a
-    /// time (to bound the memory used for sorting).
+    /// empties the cache. The changes are split into key ranges (by the first byte of the txid)
+    /// that the backend may sort and write in parallel.
     pub fn flush(&mut self) -> std::io::Result<usize> {
-        use rayon::slice::ParallelSliceMut;
-        const PARTS: usize = 4;
-        let map = &self.map;
+        const PARTS: usize = 16;
+        let mut parts: Vec<Vec<(&OutPoint, &Slot)>> = (0..PARTS).map(|_| Vec::new()).collect();
+        for (outpoint, slot) in self.map.iter() {
+            if slot.flags & DIRTY != 0 {
+                parts[outpoint.txid[0] as usize * PARTS / 256].push((outpoint, slot));
+            }
+        }
+        let written: usize = parts.iter().map(|part| part.len()).sum();
+        let parts: Vec<std::sync::Mutex<Vec<(&OutPoint, &Slot)>>> = parts.into_iter().map(std::sync::Mutex::new).collect();
         let side = &self.side;
-        let mut written = 0usize;
-        let mut part = 0usize;
-        let mut current: Vec<(&OutPoint, &Slot)> = Vec::new();
-        let mut position = 0usize;
-        let mut iter = std::iter::from_fn(|| loop {
-            if position < current.len() {
-                let (outpoint, slot) = current[position];
-                position += 1;
-                written += 1;
+        let produce = |part: usize, sink: &mut dyn FnMut(OutPoint, Option<CoinRef<'_>>)| {
+            let mut entries = std::mem::take(&mut *parts[part].lock().unwrap());
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (outpoint, slot) in entries {
                 let coin = if slot.present() {
                     let script: &[u8] = if slot.script_len == SCRIPT_IN_SIDE_TABLE { side.get(outpoint).expect("side-table script") } else { &slot.script[..slot.script_len as usize] };
                     Some(CoinRef { value: slot.value(), height: slot.height(), is_coinbase: slot.is_coinbase(), script })
                 } else {
                     None
                 };
-                return Some((*outpoint, coin));
+                sink(*outpoint, coin);
             }
-            if part == PARTS {
-                return None;
-            }
-            current.clear();
-            current.extend(map.iter().filter(|(outpoint, slot)| slot.flags & DIRTY != 0 && (outpoint.txid[0] as usize) * PARTS / 256 == part));
-            current.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
-            position = 0;
-            part += 1;
-        });
-        self.db.write(&mut iter, &self.best_block)?;
-        drop(iter);
+        };
+        self.db.write_parts(PARTS, &produce, &self.best_block)?;
+        drop(parts);
         self.map.clear();
         self.side.clear();
         self.side.shrink_to_fit();

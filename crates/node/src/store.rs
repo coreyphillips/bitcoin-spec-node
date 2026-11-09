@@ -148,6 +148,74 @@ impl CoinDb for RocksCoinDb {
         Ok(())
     }
 
+    /// The key ranges are sorted and written to separate SST files in parallel, then ingested by
+    /// one `IngestExternalFile` call, which RocksDB applies atomically (one MANIFEST record; after
+    /// a crash either every file is in the database or none is). The best-block record goes into
+    /// the last file, since its key sorts after every outpoint.
+    fn write_parts(&mut self, parts: usize, produce: &(dyn Fn(usize, &mut dyn FnMut(OutPoint, Option<CoinRef<'_>>)) + Sync), best: &Hash256) -> io::Result<()> {
+        self.sequence += 1;
+        let sequence = self.sequence;
+        let options = &self.options;
+        let sst_dir = &self.sst_dir;
+        let files: Vec<io::Result<Option<PathBuf>>> = (0..parts)
+            .into_par_iter()
+            .map(|part| {
+                let path = sst_dir.join(format!("flush-{}-{}-{}.sst", std::process::id(), sequence, part));
+                let mut writer = SstFileWriter::create(options);
+                writer.open(&path).map_err(to_io)?;
+                let mut entries = 0usize;
+                let mut failure: Option<io::Error> = None;
+                let mut buffer = Vec::with_capacity(128);
+                produce(part, &mut |outpoint, coin| {
+                    if failure.is_some() {
+                        return;
+                    }
+                    let key = outpoint_key(&outpoint);
+                    let result = match coin {
+                        Some(coin) => {
+                            buffer.clear();
+                            write_coin_ref(&mut buffer, &coin);
+                            writer.put(key, &buffer)
+                        }
+                        None => writer.delete(key),
+                    };
+                    match result {
+                        Ok(()) => entries += 1,
+                        Err(error) => failure = Some(to_io(error)),
+                    }
+                });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                if part == parts - 1 {
+                    writer.put(BEST_BLOCK_KEY, best).map_err(to_io)?;
+                    entries += 1;
+                }
+                if entries == 0 {
+                    drop(writer);
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(None);
+                }
+                writer.finish().map_err(to_io)?;
+                Ok(Some(path))
+            })
+            .collect();
+        let mut paths = Vec::new();
+        for file in files {
+            if let Some(path) = file? {
+                paths.push(path);
+            }
+        }
+        let mut ingest = IngestExternalFileOptions::default();
+        ingest.set_move_files(true);
+        let cf = self.db.cf_handle(CF_COINS).expect("coins column family");
+        let result = self.db.ingest_external_file_cf_opts(&cf, &ingest, paths.clone()).map_err(to_io);
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
     fn best_block(&self) -> Option<Hash256> {
         let cf = self.db.cf_handle(CF_COINS).expect("coins column family");
         let value = self.db.get_pinned_cf(&cf, BEST_BLOCK_KEY).expect("coin database read failed")?;
@@ -628,4 +696,47 @@ mod tests {
         corrupt[1] ^= 1;
         assert_eq!(decode_undo(&corrupt), None);
     }
+}
+
+/// Measures flushing `millions` million new coins into an empty coin database, then spending half
+/// of them (diagnostics for `bitcoin-spec-node bench-flush`).
+pub fn bench_flush(dir: &Path, millions: usize) -> io::Result<()> {
+    use consensus::tx::TxOut;
+    let database = Database::open(dir, 256 << 20)?;
+    let count = millions * 1_000_000;
+    let db = RocksCoinDb::new(&database)?;
+    let mut cache = CoinsCache::new(Box::new(db), [1u8; 32], count + count / 8);
+    let started = std::time::Instant::now();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut outpoints = Vec::with_capacity(count);
+    for i in 0..count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&state.to_le_bytes());
+        txid[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+        let outpoint = OutPoint { txid, vout: (i % 3) as u32 };
+        let mut script = vec![0x00, 0x14];
+        script.extend_from_slice(&txid[..20]);
+        cache.put(outpoint, Coin { output: TxOut { value: i as i64, script_pubkey: script }, height: (i / 3000) as i32, is_coinbase: false }, true);
+        outpoints.push(outpoint);
+    }
+    eprintln!("filled {} coins in {:.1}s ({} MiB)", count, started.elapsed().as_secs_f64(), cache.usage() >> 20);
+    let started = std::time::Instant::now();
+    let written = cache.flush()?;
+    eprintln!("flushed {} new coins in {:.1}s", written, started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    cache.prefetch(&outpoints[..count / 2]);
+    eprintln!("prefetched {} coins in {:.1}s", count / 2, started.elapsed().as_secs_f64());
+    for outpoint in &outpoints[..count / 2] {
+        cache.delete(outpoint);
+    }
+    let started = std::time::Instant::now();
+    let written = cache.flush()?;
+    eprintln!("flushed {} deletions in {:.1}s", written, started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let (hash, coins, _) = utxo_hash_of_database(&database.db, None)?;
+    eprintln!("hashed {} coins in {:.1}s: {}", coins, started.elapsed().as_secs_f64(), hash_to_display(&hash));
+    Ok(())
 }
