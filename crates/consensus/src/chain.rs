@@ -725,8 +725,15 @@ impl<S: ChainStore> ChainState<S> {
         loop {
             while prepare_failure.is_none() && next < path.len() && pending.len() < depth {
                 let id = path[next];
+                let Some(block) = self.store.get_block(self.tree.get(id)) else {
+                    // The stored data is unreadable (for example a file damaged by a system
+                    // crash): the block and its stored descendants count as not received, so a
+                    // node downloads them again and they are linked anew when they arrive.
+                    self.forget_data_from(id);
+                    next = path.len();
+                    break;
+                };
                 next += 1;
-                let block = self.store.get_block(self.tree.get(id)).expect("candidate has data");
                 let overlays: Vec<&BlockChanges> = pending.iter().map(|p| &p.changes).collect();
                 match prepare_block(&block, id, &self.tree, self.store.coins(), &overlays, &self.params) {
                     Ok(prepared) => pending.push_back(PendingBlock::start(id, block, prepared)),
@@ -881,6 +888,32 @@ impl<S: ChainStore> ChainState<S> {
         }
         tips.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         tips
+    }
+
+    /// Forgets the stored data of `id` and of every descendant (they become "not received" and
+    /// unlinked). Only for data a store can no longer read; never needed by the reference.
+    fn forget_data_from(&mut self, id: EntryId) {
+        let height = self.tree.get(id).height;
+        let mut forgotten = Vec::new();
+        for index in 0..self.tree.entries.len() {
+            let other = index as EntryId;
+            let entry = self.tree.get(other);
+            if entry.height >= height && !self.tree.is_active(other) && self.tree.ancestor(other, height) == Some(id) {
+                forgotten.push(other);
+            }
+        }
+        for other in forgotten {
+            let entry = self.tree.get_mut(other);
+            entry.has_data = false;
+            entry.sequence_id = 0;
+            self.candidates.remove(&other);
+            self.store.entry_changed(other, self.tree.get(other));
+        }
+        let tree = &self.tree;
+        for children in self.unlinked.values_mut() {
+            children.retain(|child| tree.get(*child).has_data);
+        }
+        self.unlinked.retain(|_, children| !children.is_empty());
     }
 
     /// Prunes the block and undo data of the active blocks at heights `from..to` (a node may do

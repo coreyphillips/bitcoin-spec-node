@@ -607,3 +607,12 @@ consensus code, found by my own tests.)
    production node must behave as if every block went through `process_block`, which activates.
    The build of commit `7ddd347` (used for the testnet4 holdout run) has this bug; it can only
    show after a restart.
+3. **Unreadable stored blocks stalled the node or would have crashed it** (M4, found by a
+   fault-injection test, `tools/corrupt_test.py`: kill a syncing node, truncate its 40 newest
+   block files as a system crash could, restart). The first version panicked when a candidate's
+   data could not be read; the second marked only that block as "not received", but its stored
+   descendants were linked already and had left the candidate set, so they were neither connected
+   nor downloaded again, and the node stalled. Fixed by forgetting the data of the block and of all
+   its stored descendants (unlinked, removed from candidates), so they are downloaded again and
+   linked anew when they arrive; the wanted list is also refreshed every 5 s. Not a specification
+   problem: the reference never loses data it stored.

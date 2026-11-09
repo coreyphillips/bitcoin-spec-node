@@ -275,8 +275,9 @@ pub struct Node {
     /// Last time the best header or the active tip changed (or a block or headers arrived).
     last_progress: Instant,
     progress_marker: (EntryId, EntryId),
-    /// The wanted list was computed for this (best header, tip).
+    /// The wanted list was computed for this (best header, tip), at this time.
     wanted_marker: Option<(EntryId, EntryId)>,
+    last_wanted: Instant,
     /// Set when the stop block can no longer be reached.
     fatal: Option<String>,
     /// Addresses from the DNS seeds not tried yet (discovery mode, without `--connect`).
@@ -341,6 +342,7 @@ impl Node {
             last_progress: Instant::now(),
             progress_marker: (0, 0),
             wanted_marker: None,
+            last_wanted: Instant::now(),
             fatal: None,
             candidates: Vec::new(),
             last_resolve: None,
@@ -725,10 +727,11 @@ impl Node {
     fn refresh_wanted(&mut self) {
         let best = self.chain.best_header;
         let tip = self.chain.tree.tip();
-        if self.wanted_marker == Some((best, tip)) {
+        if self.wanted_marker == Some((best, tip)) && self.last_wanted.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.wanted_marker = Some((best, tip));
+        self.last_wanted = Instant::now();
         let tree = &self.chain.tree;
         let tip_height = tree.get(tip).height;
         let best_height = tree.get(best).height;
