@@ -20,7 +20,8 @@ def main():
         tip, height = core.tip()
         node.reset()
         node.start(30721, extra=["--dbcache", "4"])
-        time.sleep(1.2)
+        # Kill mid-sync: once the node is past half of the chain.
+        node.wait_for(lambda e: e.get("event") == "tip" and e["height"] >= height // 2, 120)
         last = node.last_tip()
         node.kill()
         files = sorted(glob.glob(os.path.join(node.datadir, "blocks", "*.blk")), key=os.path.getmtime)

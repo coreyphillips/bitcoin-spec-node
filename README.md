@@ -11,6 +11,18 @@ Bitcoin Core on every block? `EXPERIMENT_LOG.md` records how it went (timeline, 
 of every conformance suite, bugs and their causes) and `SPEC_FEEDBACK.md` lists every place where
 the specification was unclear, incomplete or wrong.
 
+## Status
+
+- Every suite of the package's conformance runner passes: script tests, transaction tests, sighash,
+  BIP340/BIP341 vectors and the script assets (all 64 flag combinations, identical error
+  identifiers), the custom edge cases, the 20-file block corpus (all normative checks, chain tips
+  and UTXO set hashes), live header chains of mainnet, testnet3 and testnet4, and the interop suite
+  next to Bitcoin Core v32.1 (20 of 20 chains match).
+- Regtest scenarios against Bitcoin Core match after syncs, reorganizations (150-step storm), ten
+  SIGKILLs during a sync and damaged block files.
+- A full testnet4 sync from public peers to 150,000 (run by the experiment owner) reproduced
+  Bitcoin Core's three published UTXO set fingerprints.
+
 ## Layout
 
 | Path | Contents |
@@ -19,7 +31,8 @@ the specification was unclear, incomplete or wrong.
 | `crates/node` | The `bitcoin-spec-node` binary: `harness` (conformance protocol) and `run` (the node: RocksDB, block files, peer-to-peer) |
 | `tools/replay` | `bsn-replay`, an independent replayer for the block corpus (`spec-package/conformance/CORPUS.md`) |
 | `tools/txgen` | `bsn-txgen`, builds regtest blocks full of signed transactions and submits them to Bitcoin Core |
-| `tools/regtest.py` | Regtest interoperability scenarios against Bitcoin Core (sync, follow, reorganize, kill and restart) |
+| `tools/regtest.py` | Regtest interoperability scenarios against Bitcoin Core (sync with an output contract check, follow, reorganize, storm, kill and restart, benchmark) |
+| `tools/corrupt_test.py` | Kills a syncing node, damages its newest block files, restarts it and compares with Bitcoin Core |
 | `tools/check_custom.py` | Checks a harness against `spec-package/conformance/vectors/custom/*.jsonl` |
 | `spec-package/` | The specification package (read-only, not part of this repository's history; see below) |
 
@@ -62,8 +75,9 @@ target/release/bitcoin-spec-node run --network <main|testnet3|testnet4|signet|re
   chain (no assume-valid: every script is checked), and keeps following new blocks and
   reorganizations.
 - Standard output carries only JSON event lines; everything else goes to standard error:
-  - `{"event":"tip","tip":<hash>,"height":<n>}` progress (at most once a second, except on
-    regtest where every block is reported);
+  - `{"event":"tip","tip":<hash>,"height":<n>}` progress (at most one line per connected block:
+    the stop block and `--utxo-hash-at` heights always, other blocks at most once a second, except
+    on regtest where every block is reported);
   - `{"event":"utxo_hash","height":H,"hash_serialized_3":<hash>,"txouts":N}` when the tip reaches
     a height listed in `--utxo-hash-at` (the coin cache is flushed, and the database is hashed in
     the background from a pinned view, while the synchronization continues);

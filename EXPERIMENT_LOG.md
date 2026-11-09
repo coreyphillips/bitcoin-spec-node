@@ -636,6 +636,107 @@ on 17 threads) and by the chain thread's serial UTXO work (about 10 ms per block
 blocks per second; 12 GB coin cache (117 million coins) flushed in about 10 to 15 s each time it
 fills. Total memory stays around 14 GB.
 
+### M5: final results (2026-11-08)
+
+Final runs on commit `2b9cf29` (the build every result below comes from).
+
+Default suites (`bcs-conformance --impl "target/release/bitcoin-spec-node harness"`), verbatim:
+
+```text
+harness: bitcoin-spec-node 0.1.0 (spec v32.1-1), ops: info, script_verify, tx_check, sighash_legacy, sighash_taproot, taproot_commitment_verify, schnorr_verify, chain_reset, chain_process_block, chain_process_headers, chain_invalidate, chain_tip, chain_tips, utxo_hash
+mode: derived (all 64 consensus flag combinations)  vectors: conformance/vectors  derived: conformance/vectors/derived
+
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+script-tests   derived      79168     79168        0        0       79168        0     1.0s
+tx-valid       derived      11385     11385        0        0       11264        0     0.2s
+tx-invalid     derived       7197      7197        0        0        7113        0     0.1s
+sighash        -             1000      1000        0        0           0        0     0.0s
+bip341         -               26        26        0        0           7        0     0.0s
+bip340         -               19        19        0        0           0        0     0.0s
+script-assets  derived     239168    239168        0        0      239168        0     9.9s
+custom         -               21        21        0        0          20        0     0.0s
+corpus         -             5275      5275        0        0        2288        0     8.0s
+
+corpus file                                   checks  L0 normat.    L0 other   L1 tips   L2 utxo errors     time
+feature_bip68_sequence.node0                      31       31/31         0/0     31/31     29/29      0     0.0s
+feature_bip68_sequence.node1                      13       13/13         0/0     13/13     13/13      0     0.0s
+feature_block.node0                              128     128/128         0/0   104/104     40/40      0     0.1s
+feature_block_reorg.node0                        133     133/133         0/0   104/104     43/43      0     5.9s
+feature_cltv.node0                                11       11/11         0/0     11/11       5/5      0     0.0s
+feature_csv_activation.node0                     139     139/139         0/0     82/82     33/33      0     0.0s
+feature_dersig.node0                               6         6/6         0/0       6/6       4/4      0     0.0s
+feature_nulldummy.node0                            8         8/8         0/0       8/8       6/6      0     0.0s
+feature_segwit.node0                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node1                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_segwit.node2                              12       12/12         0/0     12/12     12/12      0     0.0s
+feature_spec_pitfalls.node0                       37       37/37         0/0     37/37     18/18      0     0.0s
+feature_spec_pitfalls.node1                        7         7/7         0/0       7/7       4/4      0     0.0s
+feature_spec_pitfalls.node2                      147     147/147         0/0   147/147   145/145      0     0.0s
+feature_taproot.node0                           4044   4044/4044         0/0   108/108 1467/1467      0     1.5s
+mining_basic.node0                               375     375/375         0/0   375/375   328/328      0     0.3s
+mining_basic.node1                                 4         3/3         1/1       4/4       4/4      0     0.0s
+p2p_invalid_block.node0                           10       10/10         0/0     10/10       5/5      0     0.0s
+p2p_segwit.node0                                 106     106/106         0/0   106/106     67/67      0     0.1s
+p2p_segwit.node1                                  41       41/41         0/0     41/41     41/41      0     0.1s
+total (20 files, 17150 events)                  5276   5275/5275         1/1 1230/1230 2288/2288
+restarts: 33 (0 skipped by the shortcut, 10781 events re-delivered); harness outcomes (diagnostic): block:accepted 8173, block:duplicate 2, block:invalid 2887, block:mutated 25, block:temporary 3, headers:accepted 703, headers:invalid 8, invalidate:ok 20
+
+RESULT: PASS
+```
+
+Interop suite (bitcoind v32.1 as a black-box peer, `--port-range 30000-30999`, node command
+`bitcoin-spec-node run --network {network} --datadir {datadir} --connect {peer} --stop-at
+{stop_at} --options {options}`), verbatim (progress lines omitted):
+
+```text
+suite          mode         cases    passed   failed   level2  l2-checked  unsupp.     time
+interop        -               20        20        0        0           0        0   378.8s
+
+rows without a check in this mode (stated rules, counted):
+  interop: 1 x scenario's final chain has blocks dated more than 2 hours after the current time (a live node uses its real clock)
+
+interop chain                                 height   result     time  detail
+generate-300                                     300    match     0.9s  tip 75fa6075001e2e86
+feature_bip68_sequence.node0                     431    match    25.3s  tip 7cf1dee5a139466e
+feature_bip68_sequence.node1                     431    match    25.2s  tip 7cf1dee5a139466e
+feature_block.node0                              134    match     8.6s  tip 11b168bdbe7f2738
+feature_block_reorg.node0                       1224    match    76.4s  tip 79365b55bdbfa159
+feature_cltv.node0                               111    match     7.2s  tip 487ab404b9130a94
+feature_csv_activation.node0                     437    match    25.4s  tip 361301b2b2936959
+feature_dersig.node0                             102    match     6.4s  tip 423b43404f22f8c2
+feature_nulldummy.node0                          105    match     6.5s  tip 455727112aee5098
+feature_segwit.node0                             171    match    10.0s  tip 1d06323b25f95532
+feature_segwit.node1                             171    match    10.0s  tip 1d06323b25f95532
+feature_segwit.node2                             171    match    10.0s  tip 1d06323b25f95532
+feature_spec_pitfalls.node0                      200    match    11.6s  tip 0d5e6e814ffe90bc
+feature_spec_pitfalls.node1                       11    match     1.4s  tip 00618f4c750252cd
+feature_spec_pitfalls.node2                      144    match     8.6s  tip 46202bbab91a3e22
+feature_taproot.node0                           1565    match    86.1s  tip 035363b53e65c94b
+mining_basic.node0                                 - excluded           
+mining_basic.node1                               367    match    20.7s  tip 00b59fd834cd2e7e
+p2p_invalid_block.node0                          103    match     6.4s  tip 6476b5ef577af9e7
+p2p_segwit.node0                                 268    match    15.7s  tip 025e52c52008615b
+p2p_segwit.node1                                 268    match    15.5s  tip 025e52c52008615b
+
+RESULT: PASS
+```
+
+Own regtest scenarios against Bitcoin Core on this build: `sync` (with the output contract check
+of bug 4: one `stopped` line, last, no repeated tip lines), `reorg` (two switches), `restart` (ten
+SIGKILLs during a sync with a 4 MiB coin cache), `storm` (150 steps) and `corrupt_test.py`: all
+match `gettxoutsetinfo` (tip, height, `hash_serialized_3`).
+
+Summary of the experiment:
+
+| | First run | Final (`2b9cf29`) |
+|---|---|---|
+| script-tests, tx-valid, tx-invalid, sighash, bip341, bip340, script-assets | all pass, level 2 identical (M1) | all pass, level 2 identical |
+| custom edge cases | 21/21 (M1, own checker) | 21/21 |
+| block corpus | 16 files: 4,951/4,951 normative, 935/935 tips, 2,078/2,078 UTXO hashes (M2, own replayer) | 20 files: 5,275/5,275 normative, 1/1 other, 1,230/1,230 tips, 2,288/2,288 UTXO hashes |
+| interop with bitcoind | 18/18 chains match (M3) | 20/20 chains match |
+| headers-live | mainnet 975,114 and testnet4 159,961 headers | also testnet3, 5,303,811 headers |
+| testnet4 holdout (experiment owner) | | 3/3 fingerprints identical to Core's, build `7ddd347` |
+
 ## Bugs found
 
 Every bug found so far, with its root cause and whether the specification was at fault. (The
