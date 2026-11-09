@@ -20,6 +20,10 @@ pub struct PeerSlot {
     pub in_flight: usize,
     /// Height of the best block the peer is known to have.
     pub height: i32,
+    /// The peer held up the next block: until then it gets requests only when no other ready
+    /// peer could take them (the period doubles with every stall).
+    pub avoid_until: Option<Instant>,
+    pub stalls: u32,
 }
 
 pub struct DownloadState {
@@ -55,7 +59,7 @@ impl DownloadState {
     }
 
     pub fn add_peer(&mut self, peer: usize, sender: Sender<Vec<u8>>) {
-        self.peers.insert(peer, PeerSlot { sender, ready: false, in_flight: 0, height: 0 });
+        self.peers.insert(peer, PeerSlot { sender, ready: false, in_flight: 0, height: 0, avoid_until: None, stalls: 0 });
     }
 
     pub fn set_ready(&mut self, peer: usize, height: i32) {
@@ -76,10 +80,6 @@ impl DownloadState {
         }
     }
 
-    pub fn ready_peers(&self) -> usize {
-        self.peers.values().filter(|slot| slot.ready).count()
-    }
-
     /// Forgets a peer; its outstanding requests go back to the front of the queue.
     pub fn remove_peer(&mut self, peer: usize) {
         self.peers.remove(&peer);
@@ -92,6 +92,27 @@ impl DownloadState {
             }
         }
         self.fill();
+    }
+
+    /// The peer held up the next block: its outstanding requests go back to the front of the
+    /// queue (for other peers), and it is avoided for 30 s, doubling with each stall up to 8
+    /// minutes. Returns the number of requests taken back.
+    pub fn penalize(&mut self, peer: usize) -> usize {
+        let mut lost: Vec<(Hash256, i32)> = self.in_flight.iter().filter(|(_, (owner, _, _))| *owner == peer).map(|(h, (_, _, height))| (*h, *height)).collect();
+        lost.sort_by_key(|(_, height)| *height);
+        for (hash, height) in lost.iter().rev() {
+            self.in_flight.remove(hash);
+            if self.queued.insert(*hash) {
+                self.queue.push_front((*hash, *height));
+            }
+        }
+        if let Some(slot) = self.peers.get_mut(&peer) {
+            slot.in_flight = 0;
+            slot.stalls += 1;
+            slot.avoid_until = Some(Instant::now() + Duration::from_secs(30 << (slot.stalls - 1).min(4)));
+        }
+        self.fill();
+        lost.len()
     }
 
     /// Replaces the wanted list (oldest first). Blocks already in flight stay in flight.
@@ -152,6 +173,28 @@ impl DownloadState {
         self.in_flight.values().min_by_key(|(_, _, height)| *height).map(|(peer, at, height)| (*peer, at.elapsed(), *height))
     }
 
+    /// Ready peers other than `peer` that are not avoided and have the block at `height`.
+    pub fn alternatives(&self, peer: usize, height: i32) -> usize {
+        let now = Instant::now();
+        self.peers.iter().filter(|(id, slot)| **id != peer && slot.ready && slot.height >= height && slot.avoid_until.is_none_or(|until| until <= now)).count()
+    }
+
+    /// One line about the download state, for the diagnostics printed while the tip waits.
+    pub fn describe(&self, next: &Hash256) -> String {
+        let next_state = match self.in_flight.get(next) {
+            Some((peer, at, _)) => format!("in flight to peer {peer} for {} s", at.elapsed().as_secs()),
+            None if self.queued.contains(next) => "queued".to_string(),
+            None => "not queued".to_string(),
+        };
+        let mut peers: Vec<(usize, bool, usize, i32)> = self.peers.iter().map(|(id, slot)| (*id, slot.ready, slot.in_flight, slot.height)).collect();
+        peers.sort_unstable();
+        let peers: Vec<String> = peers
+            .iter()
+            .map(|(id, ready, in_flight, height)| format!("{id}{}{in_flight}@{height}", if *ready { ":" } else { ":not ready:" }))
+            .collect();
+        format!("{next_state}; queue {}, in flight {}, buffered {}; peers {}", self.queue.len(), self.in_flight.len(), self.buffered, peers.join(" "))
+    }
+
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
@@ -174,7 +217,17 @@ impl DownloadState {
                 self.queued.remove(&hash);
                 continue;
             }
-            let mut ids: Vec<usize> = self.peers.iter().filter(|(_, s)| s.ready && s.in_flight < self.max_per_peer && s.height >= height).map(|(id, _)| *id).collect();
+            // Avoided peers (they stalled recently) are used only when no other ready peer has
+            // the block, so they cannot hold up the download again.
+            let now = Instant::now();
+            let avoided = |slot: &PeerSlot| slot.avoid_until.is_some_and(|until| until > now);
+            let others_exist = self.peers.values().any(|s| s.ready && s.height >= height && !avoided(s));
+            let mut ids: Vec<usize> = self
+                .peers
+                .iter()
+                .filter(|(_, s)| s.ready && s.in_flight < self.max_per_peer && s.height >= height && !(others_exist && avoided(s)))
+                .map(|(id, _)| *id)
+                .collect();
             if ids.is_empty() {
                 break;
             }

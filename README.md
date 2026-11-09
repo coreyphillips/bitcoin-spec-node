@@ -33,6 +33,7 @@ the specification was unclear, incomplete or wrong.
 | `tools/txgen` | `bsn-txgen`, builds regtest blocks full of signed transactions and submits them to Bitcoin Core |
 | `tools/regtest.py` | Regtest interoperability scenarios against Bitcoin Core (sync with an output contract check, follow, reorganize, storm, kill and restart, benchmark) |
 | `tools/corrupt_test.py` | Kills a syncing node, damages its newest block files, restarts it and compares with Bitcoin Core |
+| `tools/stall_test.py` | Syncs from Bitcoin Core and from a fake peer that never answers block requests |
 | `tools/check_custom.py` | Checks a harness against `spec-package/conformance/vectors/custom/*.jsonl` |
 | `spec-package/` | The specification package (read-only, not part of this repository's history; see below) |
 
@@ -171,4 +172,5 @@ python3 -I tools/regtest.py restart kills=10          # SIGKILL at random moment
 python3 -I tools/regtest.py storm steps=150           # reorganizations of depth 1 to 8, then a restart
 python3 -I tools/regtest.py bench                     # time a sync of a large chain (built once)
 python3 -I tools/corrupt_test.py                      # kill, damage the newest block files, restart
+python3 -I tools/stall_test.py                        # a second peer that never sends blocks
 ```

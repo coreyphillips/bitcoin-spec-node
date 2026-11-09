@@ -286,6 +286,9 @@ pub struct Node {
     /// A peer that holds the next needed block longer than this is stalling.
     stall_timeout: Duration,
     last_stall: Instant,
+    /// The tip and since when it is the tip; when the last waiting diagnostic was printed.
+    tip_since: (EntryId, Instant),
+    last_wait_report: Instant,
 }
 
 /// Initial and maximum stall timeouts (Bitcoin Core: `BLOCK_STALLING_TIMEOUT_DEFAULT`, `_MAX`).
@@ -348,6 +351,8 @@ impl Node {
             last_resolve: None,
             stall_timeout: STALL_TIMEOUT_MIN,
             last_stall: Instant::now(),
+            tip_since: (0, Instant::now()),
+            last_wait_report: Instant::now(),
         })
     }
 
@@ -784,19 +789,21 @@ impl Node {
         }
         // A peer holding up the next block while others could deliver it is stalling: drop it
         // (discovery mode, where it is replaced) or ask someone else (Bitcoin Core: stalling).
-        let (oldest, ready) = {
-            let downloads = self.downloads.lock().unwrap();
-            (downloads.oldest_needed(), downloads.ready_peers())
-        };
+        let oldest = self.downloads.lock().unwrap().oldest_needed();
         if let Some((staller, waited, height)) = oldest {
-            if ready > 1 && height == self.chain.tip().height + 1 && waited > self.stall_timeout {
+            let alternatives = self.downloads.lock().unwrap().alternatives(staller, height);
+            // With discovery a stalling peer is replaced even when no other peer is ready.
+            if (alternatives > 0 || self.discovery()) && height == self.chain.tip().height + 1 && waited > self.stall_timeout {
                 eprintln!("peer {staller} stalls block {height} ({} s); stall timeout now {} s", waited.as_secs(), (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX).as_secs());
                 self.stall_timeout = (self.stall_timeout * 2).min(STALL_TIMEOUT_MAX);
                 self.last_stall = Instant::now();
                 if self.discovery() {
                     self.disconnect(staller, "stalling");
                 } else {
-                    self.downloads.lock().unwrap().expire(waited.saturating_sub(Duration::from_millis(1)));
+                    // A peer given with --connect stays, but its requests go to the others and it
+                    // is avoided for a while.
+                    let taken = self.downloads.lock().unwrap().penalize(staller);
+                    eprintln!("peer {staller}: {taken} block requests moved to other peers");
                 }
             }
         }
@@ -811,6 +818,30 @@ impl Node {
             self.request_headers(peer, best);
         }
         self.refresh_wanted();
+        // Diagnostics: say what the next block is waiting for when the tip has not moved for a
+        // while although the header chain goes further.
+        let tip = self.chain.tree.tip();
+        if tip != self.tip_since.0 {
+            self.tip_since = (tip, Instant::now());
+        }
+        if self.tip_since.1.elapsed() > Duration::from_secs(10) && self.last_wait_report.elapsed() > Duration::from_secs(10) {
+            let tree = &self.chain.tree;
+            let next_height = tree.get(tip).height + 1;
+            if let Some(next) = tree.ancestor(self.chain.best_header, next_height) {
+                let entry = tree.get(next);
+                let state = self.downloads.lock().unwrap().describe(&entry.hash);
+                eprintln!(
+                    "waiting for block {} {} for {} s: data {}, failed {}; {state}; stall timeout {} s",
+                    next_height,
+                    hash_to_display(&entry.hash),
+                    self.tip_since.1.elapsed().as_secs(),
+                    entry.has_data,
+                    entry.failed,
+                    self.stall_timeout.as_secs()
+                );
+                self.last_wait_report = Instant::now();
+            }
+        }
         // Progress, and giving up on an unreachable stop block.
         let marker = (self.chain.best_header, self.chain.tree.tip());
         if marker != self.progress_marker {

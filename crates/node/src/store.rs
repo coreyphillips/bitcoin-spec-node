@@ -644,12 +644,31 @@ impl ChainStore for DiskStore {
             return Some(block.clone());
         }
         self.writer_barrier();
-        let bytes = std::fs::read(self.block_path(&entry.hash)).ok()?;
-        let data = deserialize_block_data(&bytes).ok()?;
-        if data.hash != entry.hash {
-            return None;
+        let path = self.block_path(&entry.hash);
+        // Transient errors (for example too many open files) are retried; data that is missing
+        // or damaged is reported, and the chain state downloads the block again.
+        let mut attempt = 0;
+        let bytes = loop {
+            match std::fs::read(&path) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound && attempt < 5 => {
+                    attempt += 1;
+                    eprintln!("warning: reading block {} failed ({error}); retrying", hash_to_display(&entry.hash));
+                    std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+                }
+                Err(error) => {
+                    eprintln!("stored block {} at height {} is unreadable ({error}); it will be downloaded again", hash_to_display(&entry.hash), entry.height);
+                    return None;
+                }
+            }
+        };
+        match deserialize_block_data(&bytes) {
+            Ok(data) if data.hash == entry.hash => Some(Arc::new(data)),
+            _ => {
+                eprintln!("stored block {} at height {} is damaged; it will be downloaded again", hash_to_display(&entry.hash), entry.height);
+                None
+            }
         }
-        Some(Arc::new(data))
     }
 
     fn put_undo(&mut self, entry: &BlockEntry, _block: &Arc<BlockData>, undo: BlockUndo) {

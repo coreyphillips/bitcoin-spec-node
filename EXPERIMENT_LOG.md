@@ -560,6 +560,13 @@ RESULT: PASS
   signet, all 330,021 headers and every block to height 140,666 in 182 s (each block's signet
   solution checked; up to 1,537 blocks/s); testnet3, all 5,303,812 headers and blocks to height
   36,045 in 171 s. No block was rejected on either network.
+- Public mainnet from DNS-seed peers to the BIP16 exception block 170,060 (`--stop-at
+  00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22`), which also passes the two
+  BIP30 exception blocks 91,842 and 91,880: one `stopped` line, last, exit status 0, no block
+  rejected, `hash_serialized_3` `c50a54d1411cfe67f764812555114f9d1e34b04063986d69823892353edc4f0f`
+  (no published value to compare with at that height; two runs gave the same value). First run
+  457 s, including a 50 s wait at 145,657 (see bug 5); second run, with the waiting diagnostics of
+  bug 5, 179 s.
 
 ### Holdout: testnet4 full sync (run by the experiment owner, 2026-11-08)
 
@@ -778,3 +785,21 @@ consensus code, found by my own tests.)
    and at the stop block: it reported "2 repeated tip lines" on the build before the fix and OK
    after. The `stopped` line itself is printed only by `finish()`, which consumes the node, so it
    cannot appear twice in one process. Not a specification problem.
+5. **A stalling peer given with `--connect` was asked again and again** (found by my own test,
+   `tools/stall_test.py`, written after a 50 s wait at height 145,657 in the first public mainnet
+   run above). The fake peer of that test completes the handshake and serves the header chain but
+   never answers block requests; the node also connects to Bitcoin Core. The stall rule fired
+   (the peer held up the next block for longer than the stall timeout), but with `--connect` it
+   only re-queued the stalled request, and the request could go straight back to the same peer,
+   while the stall timeout doubled each time: 402 blocks took 123 s. Chapter 14.4 says to time
+   out the request and ask another peer; the node now takes back all of the staller's requests
+   and avoids that peer for 30 s (doubling with each stall, up to 8 minutes) whenever another ready
+   peer has the block: the same test takes 2.7 s. With DNS-seed discovery a staller is
+   disconnected (and replaced) as before, now also when it is the only ready peer. With a single
+   `--connect` peer nothing changes (there is nobody else to ask; the 64 s request timeout
+   applies). The cause of the 50 s wait in the public run is not certain: it ended when the peer
+   holding 16 requests disconnected, but the stall rule did not fire for it; the node now prints,
+   every 10 s while the tip waits, what the next block is waiting for (data, request, queue, and
+   every peer's state), so a recurrence explains itself. Not a specification problem. Also: a
+   stored block that cannot be read is now reported on standard error (it was silently
+   downloaded again), and transient read errors are retried.
